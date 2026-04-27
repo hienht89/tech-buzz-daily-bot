@@ -3,12 +3,15 @@ import type { Summary } from "./ai.js";
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHANNEL_ID;
-const SIGNATURE = process.env.TELEGRAM_SIGNATURE ?? "🐝 Tech Buzz Daily";
+const SIGNATURE_NAME = process.env.TELEGRAM_SIGNATURE ?? "Tech Buzz Daily";
+const SIGNATURE_EMOJI = process.env.TELEGRAM_SIGNATURE_EMOJI ?? "🐝";
 
 if (!TOKEN) throw new Error("Missing TELEGRAM_BOT_TOKEN environment variable");
 if (!CHAT_ID) throw new Error("Missing TELEGRAM_CHANNEL_ID environment variable");
 
 const API = `https://api.telegram.org/bot${TOKEN}`;
+
+const CHANNEL_HANDLE = CHAT_ID.startsWith("@") ? CHAT_ID.slice(1) : null;
 
 function escapeHtml(text: string): string {
   return text
@@ -19,6 +22,13 @@ function escapeHtml(text: string): string {
 
 function escapeHtmlAttr(text: string): string {
   return escapeHtml(text).replace(/"/g, "&quot;");
+}
+
+function buildSignatureLine(): string {
+  const brand = `${SIGNATURE_EMOJI} <b>${escapeHtml(SIGNATURE_NAME)}</b>`;
+  if (!CHANNEL_HANDLE) return `— ${brand}`;
+  const handleLink = `<a href="https://t.me/${escapeHtmlAttr(CHANNEL_HANDLE)}">@${escapeHtml(CHANNEL_HANDLE)}</a>`;
+  return `— ${brand} · ${handleLink}`;
 }
 
 function formatCaption(article: Article, summary: Summary): string {
@@ -37,7 +47,7 @@ function formatCaption(article: Article, summary: Summary): string {
     "",
     `🔗 <a href="${link}">${source}</a>`,
     "",
-    `— ${escapeHtml(SIGNATURE)}`,
+    buildSignatureLine(),
   ].join("\n");
 }
 
