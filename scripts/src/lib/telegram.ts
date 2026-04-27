@@ -171,6 +171,13 @@ export async function postArticle(article: Article, summary: Summary): Promise<v
     chat_id: CHAT_ID,
     text: trimToLength(caption, MAX_MESSAGE_LEN),
     parse_mode: "HTML",
-    link_preview_options: { is_disabled: false },
+    link_preview_options: {
+      is_disabled: false,
+      url: article.link,
+      // Hiển thị preview Ở TRÊN text (giả lập format sendPhoto: ảnh/preview ở trên, text dưới)
+      show_above_text: true,
+      // Ưu tiên ảnh to, không phải thumbnail nhỏ
+      prefer_large_media: true,
+    },
   });
 }
