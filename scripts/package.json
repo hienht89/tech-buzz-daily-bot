@@ -5,7 +5,12 @@
   "type": "module",
   "scripts": {
     "hello": "tsx ./src/hello.ts",
+    "post-news": "tsx ./src/postNews.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@google/genai": "^1.40.0",
+    "rss-parser": "^3.13.0"
   },
   "devDependencies": {
     "@types/node": "catalog:",

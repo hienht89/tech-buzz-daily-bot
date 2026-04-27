@@ -1,0 +1,75 @@
+name: Post Tech News to Telegram
+
+on:
+  schedule:
+    # Mỗi 2 tiếng (vào phút 5 để tránh giờ cao điểm của GitHub cron)
+    - cron: "5 */2 * * *"
+  workflow_dispatch: # Cho phép chạy thủ công từ tab Actions
+
+permissions:
+  contents: write # Cần để commit posted.json về repo
+
+concurrency:
+  group: post-news
+  cancel-in-progress: false
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          TELEGRAM_SIGNATURE: ${{ secrets.TELEGRAM_SIGNATURE }}
+        run: pnpm --filter @workspace/scripts run post-news
+
+      - name: Commit posted history
+        if: always() # commit dù bot fail (có thể đã post xong nhưng crash sau đó)
+        run: |
+          set -e
+          git config user.name "tech-buzz-bot"
+          git config user.email "bot@techbuzz.local"
+
+          if [[ -z "$(git status --porcelain scripts/data/posted.json)" ]]; then
+            echo "No new posts to commit"
+            exit 0
+          fi
+
+          git add scripts/data/posted.json
+          git commit -m "chore: update posted history [skip ci]"
+
+          # Retry push lên đến 5 lần với rebase nếu remote đã thay đổi
+          for attempt in 1 2 3 4 5; do
+            if git push; then
+              echo "Push thành công ở lần thử $attempt"
+              exit 0
+            fi
+            echo "Push lần $attempt thất bại, pull --rebase rồi thử lại..."
+            git pull --rebase --autostash origin "$GITHUB_REF_NAME" || true
+            sleep $((attempt * 3))
+          done
+
+          echo "::error::Không push được posted.json sau 5 lần thử — bài có thể bị đăng lại trong lần chạy sau!"
+          exit 1
