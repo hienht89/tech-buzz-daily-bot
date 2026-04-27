@@ -4,7 +4,7 @@ import type { Summary } from "./ai.js";
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHANNEL_ID;
 const SIGNATURE_NAME = process.env.TELEGRAM_SIGNATURE ?? "Tech Buzz Daily";
-const SIGNATURE_EMOJI = process.env.TELEGRAM_SIGNATURE_EMOJI ?? "⚡";
+const SIGNATURE_EMOJI = process.env.TELEGRAM_SIGNATURE_EMOJI ?? "🐝";
 
 if (!TOKEN) throw new Error("Missing TELEGRAM_BOT_TOKEN environment variable");
 if (!CHAT_ID) throw new Error("Missing TELEGRAM_CHANNEL_ID environment variable");
@@ -24,36 +24,30 @@ function escapeHtmlAttr(text: string): string {
   return escapeHtml(text).replace(/"/g, "&quot;");
 }
 
-function buildFooter(article: Article): string {
-  const sourceName = escapeHtml(article.source);
-  const sourceLink = escapeHtmlAttr(article.link);
-  const sourceLine = `📰 <b>Nguồn:</b> <a href="${sourceLink}"><b>${sourceName}</b></a>`;
-
-  const brandName = escapeHtml(SIGNATURE_NAME);
-  let brandLine: string;
-  if (CHANNEL_HANDLE) {
-    const channelUrl = `https://t.me/${escapeHtmlAttr(CHANNEL_HANDLE)}`;
-    brandLine = `${SIGNATURE_EMOJI} <b>Đăng ký:</b> <a href="${channelUrl}"><b>@${escapeHtml(CHANNEL_HANDLE)}</b></a> · ${brandName}`;
-  } else {
-    brandLine = `${SIGNATURE_EMOJI} <b>${brandName}</b>`;
-  }
-
-  return `<blockquote>${sourceLine}\n${brandLine}</blockquote>`;
+function buildSignatureLine(): string {
+  const brand = `${SIGNATURE_EMOJI} <b>${escapeHtml(SIGNATURE_NAME)}</b>`;
+  if (!CHANNEL_HANDLE) return `— ${brand}`;
+  const handleLink = `<a href="https://t.me/${escapeHtmlAttr(CHANNEL_HANDLE)}">@${escapeHtml(CHANNEL_HANDLE)}</a>`;
+  return `— ${brand} · ${handleLink}`;
 }
 
 function formatCaption(article: Article, summary: Summary): string {
   const title = escapeHtml(summary.title);
   const body = escapeHtml(summary.body);
   const takeaway = escapeHtml(summary.takeaway);
+  const source = escapeHtml(article.source);
+  const link = escapeHtmlAttr(article.link);
 
   return [
     `<b>${title}</b>`,
     "",
     body,
     "",
-    `💡 <i>${takeaway}</i>`,
+    `💡 ${takeaway}`,
     "",
-    buildFooter(article),
+    `🔗 <a href="${link}">${source}</a>`,
+    "",
+    buildSignatureLine(),
   ].join("\n");
 }
 
