@@ -12,6 +12,12 @@ uri = "file://attached_assets/generated_images/techbuzz_logo_minimal.png"
 type = "image"
 title = "techbuzz minimal logo"
 
+[[generated]]
+id = "3VS2H1l67yny1R1c0l9gl"
+uri = "file://attached_assets/generated_images/techbuzz_logo_final.png"
+type = "image"
+title = "techbuzz final logo"
+
 [[outputs]]
 id = "1Y0wegD2C97rZY9Qs2lsM"
 uri = "file://attached_assets/generated_images/techbuzz_logo_mascot.png"
@@ -23,3 +29,9 @@ id = "t1BTMQFpaeAWm4IOasz0X"
 uri = "file://attached_assets/generated_images/techbuzz_logo_minimal.png"
 type = "image"
 title = "Phương án 2 — Tối giản hiện đại (biểu tượng hình học)"
+
+[[outputs]]
+id = "iXZWgsvMV0q1ak5wQItW5"
+uri = "file://attached_assets/generated_images/techbuzz_logo_final.png"
+type = "image"
+title = "Tech Buzz Daily — Logo chính thức"
