@@ -2,8 +2,10 @@ name: Post Tech News to Telegram
 
 on:
   schedule:
-    # Mỗi 2 tiếng (vào phút 5 để tránh giờ cao điểm của GitHub cron)
-    - cron: "5 */2 * * *"
+    # Chạy ở phút 45 các giờ lẻ UTC (1, 3, 5, ..., 23) — sớm 15 phút trước mốc giờ chẵn UTC.
+    # Mục đích: đăng ĐÚNG mốc giờ lẻ Việt Nam (1:00, 3:00, 5:00... UTC+7).
+    # Bot sẽ tự sleep tới đúng mốc giờ rồi mới đăng (bù trừ delay của GitHub Actions).
+    - cron: "45 1-23/2 * * *"
   workflow_dispatch: # Cho phép chạy thủ công từ tab Actions
 
 permissions:
@@ -16,7 +18,7 @@ concurrency:
 jobs:
   post:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 40 # đủ chỗ cho bot sleep tới mốc giờ (tối đa 30 phút) + đăng bài
     steps:
       - name: Checkout
         uses: actions/checkout@v4
