@@ -26,8 +26,3 @@ externalPort = 80
 [[ports]]
 localPort = 8081
 externalPort = 8081
-
-[userenv]
-
-[userenv.shared]
-TELEGRAM_CHANNEL_ID = "@techbuzz_daily"
