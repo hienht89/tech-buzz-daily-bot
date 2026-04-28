@@ -26,8 +26,8 @@ function formatCaption(article: Article, summary: Summary, env: Env): string {
   const title = escapeHtml(summary.title);
   const body = escapeHtml(summary.body);
   const takeaway = escapeHtml(summary.takeaway);
-  const source = escapeHtml(article.source);
-  const link = escapeHtmlAttr(article.link);
+  const linkHref = escapeHtmlAttr(article.link);
+  const linkText = escapeHtml(article.link);
 
   return [
     `<b>${title}</b>`,
@@ -36,7 +36,7 @@ function formatCaption(article: Article, summary: Summary, env: Env): string {
     "",
     `💡 ${takeaway}`,
     "",
-    `🔗 <a href="${link}">${source}</a>`,
+    `🔗 <a href="${linkHref}">${linkText}</a>`,
     "",
     buildSignatureLine(env),
   ].join("\n");

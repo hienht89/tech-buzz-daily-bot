@@ -4,12 +4,13 @@ compatibility_date = "2024-12-01"
 compatibility_flags = ["nodejs_compat"]
 
 # ────────────────────────────────────────────────────────────────────────────
-# CRON: chạy mỗi 2 tiếng vào ĐÚNG giờ chẵn UTC (= giờ lẻ Việt Nam UTC+7)
-# UTC 00:00, 02:00, 04:00... → VN 07:00, 09:00, 11:00, ..., 23:00, 01:00, 03:00, 05:00
+# CRON: chạy MỖI GIỜ từ 7h sáng đến 0h đêm Việt Nam (UTC+7) → 18 bài/ngày
+# UTC 00,01,02,...,17 → VN 07,08,09,...,23,00
+# Bài đầu tiên: 07:00 VN. Bài cuối: 00:00 VN (nửa đêm).
 # Cloudflare Cron có độ chính xác trong vài giây.
 # ────────────────────────────────────────────────────────────────────────────
 [triggers]
-crons = ["0 */2 * * *"]
+crons = ["0 0-17 * * *"]
 
 # ────────────────────────────────────────────────────────────────────────────
 # KV: lưu lịch sử các URL đã đăng (thay thế posted.json)
