@@ -17,7 +17,7 @@ crons = ["0 */2 * * *"]
 # ────────────────────────────────────────────────────────────────────────────
 [[kv_namespaces]]
 binding = "POSTED_KV"
-id = "REPLACE_WITH_YOUR_KV_ID"
+id = "70ab341227fd4badb90dfa2d761dde32"
 
 # ────────────────────────────────────────────────────────────────────────────
 # VARS không nhạy cảm (nhạy cảm dùng `wrangler secret put`)
