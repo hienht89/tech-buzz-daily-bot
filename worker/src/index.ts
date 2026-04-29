@@ -5,7 +5,8 @@ import {
   type SourceCategory,
 } from "./sources.js";
 import { fetchAllSources, type Article, type SourceStat } from "./rss.js";
-import { summarizeArticle } from "./ai.js";
+import { summarizeArticle, getProviders } from "./ai.js";
+import { probeProviders } from "./diag.js";
 import { postArticle } from "./telegram.js";
 import { extractOgImage } from "./og.js";
 import { isRelevantArxivPaper } from "./filter.js";
@@ -141,6 +142,12 @@ type PickResult = {
   clusteredCount: number;
   /** Số bài bị skip vì score < MIN_SCORE_THRESHOLD (Phase 15). */
   skippedLowScore: number;
+  /**
+   * Top 10 article PRE-gate (sau cluster, trước MIN_SCORE_THRESHOLD + KV check).
+   * Dùng để diagnostic: nếu eligibleCount=0 mà topPreGate vẫn có bài, biết
+   * ngay là threshold quá cao chứ không phải hết bài (Phase 16).
+   */
+  topPreGate: Article[];
 };
 
 /**
@@ -190,6 +197,7 @@ async function pickCandidates(env: Env, runId: string): Promise<PickResult> {
       scoredCount: 0,
       clusteredCount: 0,
       skippedLowScore: 0,
+      topPreGate: [],
     };
   }
 
@@ -277,6 +285,7 @@ async function pickCandidates(env: Env, runId: string): Promise<PickResult> {
     scoredCount: arxivPassed.length,
     clusteredCount: clustered.length,
     skippedLowScore,
+    topPreGate: clustered.slice(0, 10),
   };
 }
 
@@ -360,6 +369,11 @@ async function runBotInternal(
   const deadProviders = new Set<string>();
   let fallbackWarned = false;
   let attempts = 0;
+  // Phase 16 diagnostic: ghi nhớ lỗi cuối cùng để bubble lên `reason` field —
+  // trước đây dry-run chỉ trả "all candidates failed" mà không nói lỗi gì,
+  // làm khó debug khi quota Gemini cạn (vd today: 18 tick × N candidate đều
+  // fail vì free-tier 429, KV không bao giờ được ghi → /stats vẫn báo 0/18).
+  let lastAiError: string | undefined;
   const total = pick.candidates.length;
 
   while (true) {
@@ -402,9 +416,9 @@ async function runBotInternal(
       console.log(`${tag}   [provider=${aiProvider}] Title: ${summary.title}`);
     } catch (err) {
       const fc = await incrementFailCount(env, article.link).catch(() => -1);
-      console.error(
-        `${tag}   AI fail (count→${fc}): ${(err as Error).message?.slice(0, 400)}`,
-      );
+      const msg = (err as Error).message?.slice(0, 400) ?? "unknown";
+      lastAiError = msg;
+      console.error(`${tag}   AI fail (count→${fc}): ${msg}`);
       continue; // thử bài tiếp theo
     }
 
@@ -519,13 +533,19 @@ async function runBotInternal(
   }
 
   console.warn(
-    `[bot:${runId}] Tried ${attempts}/${total} candidates, none succeeded.`,
+    `[bot:${runId}] Tried ${attempts}/${total} candidates, none succeeded.` +
+      (lastAiError ? ` Last AI error: ${lastAiError}` : ""),
   );
   return {
     runId,
     posted: false,
     attempted: attempts,
-    reason: "all candidates failed",
+    // Phase 16: bubble lastAiError lên `reason` để dry-run/admin curl thấy
+    // ngay nguyên nhân thực sự (vd "All AI providers failed. Errors: gemini-2.5-flash#k0: HTTP 429 ...")
+    // mà không cần phải mở wrangler tail.
+    reason: lastAiError
+      ? `all candidates failed — lastAiError: ${lastAiError}`
+      : "all candidates failed",
   };
 }
 
@@ -690,7 +710,7 @@ export default {
       try {
         const pick = await pickCandidates(env, runId);
         const now = new Date();
-        const top = pick.candidates.slice(0, 10).map((a) => ({
+        const mapArticle = (a: Article) => ({
           title: a.title,
           source: a.source,
           category: a.sourceCategory,
@@ -699,7 +719,12 @@ export default {
           pubDate: a.pubDate.toISOString(),
           score: a.score,
           breakdown: scoreArticle(a, now),
-        }));
+        });
+        const top = pick.candidates.slice(0, 10).map(mapArticle);
+        // Phase 16 diagnostic: top 10 PRE-gate (trước MIN_SCORE_THRESHOLD + KV
+        // check). Cho phép admin nhìn thấy điểm thực tế của batch hiện tại
+        // → chỉnh threshold cho hợp lý nếu eligibleCount=0 do threshold quá cao.
+        const topPreGate = pick.topPreGate.map(mapArticle);
         const body = {
           runId,
           totalFetched: pick.totalFetched,
@@ -711,6 +736,7 @@ export default {
           minScoreThreshold: MIN_SCORE_THRESHOLD,
           skippedLowScore: pick.skippedLowScore,
           top,
+          topPreGate,
           checkedAt: new Date().toISOString(),
         };
         return new Response(JSON.stringify(body, null, 2), {
@@ -723,6 +749,49 @@ export default {
           { status: 500, headers: { "Content-Type": "application/json" } },
         );
       }
+    }
+
+    // ───── /diag_ai: probe từng AI provider riêng lẻ (cần auth) ─────
+    // Phase 16 diagnostic: gọi mỗi provider trong getProviders(env) trên 1
+    // article giả tí xíu, KHÔNG đụng KV / Telegram / RSS pipeline. Trả về
+    // {provider, ok, error} cho từng cái — dùng để confirm "Gemini hết quota,
+    // OpenRouter có cứu được không?" mà không cần đợi cron tick.
+    //
+    // Latency: chạy SEQUENTIAL (không parallel) → tốn ~latency mỗi provider
+    // cộng dồn. Khi tất cả thành công, mỗi provider ~1-3s nên tổng ~10-20s
+    // cho 6 provider. Khi fail nhanh (HTTP 4xx ngay) thì <1s/provider.
+    // Khi 1 provider treo, có thể chạm timeout 30s mặc định. Acceptable cho
+    // admin diagnostic — KHÔNG nên gắn vào health check tự động.
+    if (url.pathname === "/diag_ai") {
+      if (!isAuthorized(req, env)) {
+        return new Response("Unauthorized\n", { status: 401 });
+      }
+      const fakeArticle: Article = {
+        title: "Test ping article for AI provider health check",
+        link: "https://example.com/diag",
+        canonicalUrl: "https://example.com/diag",
+        pubDate: new Date(),
+        contentSnippet:
+          "This is a tiny ping article used to check if AI providers respond. " +
+          "OpenAI announced something. The system works. End of test content.",
+        source: "diag",
+        sourceCategory: "core",
+        sourcePriority: 1,
+      };
+      const providers = getProviders(env);
+      const results = await probeProviders(providers, fakeArticle);
+      return new Response(
+        JSON.stringify(
+          {
+            providerCount: providers.length,
+            results,
+            checkedAt: new Date().toISOString(),
+          },
+          null,
+          2,
+        ),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
     }
 
     // ───── /run: manual trigger (cần auth) ─────
@@ -784,7 +853,8 @@ export default {
         "  GET  /sources   (Bearer)      — source health report\n" +
         "  GET  /stats     (Bearer)      — bucket usage hôm nay + recent titles\n" +
         "  GET  /last      (Bearer)      — snapshot bài đăng gần nhất\n" +
-        "  GET  /top_today (Bearer)      — top 10 candidate eligible + score breakdown\n",
+        "  GET  /top_today (Bearer)      — top 10 candidate eligible + topPreGate (top 10 trước MIN_SCORE_THRESHOLD)\n" +
+        "  GET  /diag_ai   (Bearer)      — Phase 16: probe từng AI provider, trả {provider, ok, ms, error}\n",
       { status: 200, headers: { "Content-Type": "text/plain" } },
     );
   },

@@ -62,6 +62,12 @@ Deployed to Cloudflare Workers. Migrated từ GitHub Actions vì GH Actions cron
   - **Quota mới** (`bucket.ts`): `core 6 / ai 5 / dev 4 / research 1 / trend 2 = 18` (cap, không phải target). Giảm `research` từ 2→1 để tránh arxiv niche dominate khi nguồn chính ít. Tăng `core` 5→6 bù lại. Vì cron chỉ 9 tick/ngày, cap 18 chỉ kick in khi 1 category có quá nhiều bài ngon.
   - **Key rotation hướng dẫn user**: nên tạo thêm 1 tài khoản Google + 1 Gemini API key (https://aistudio.google.com/apikey) → set vào CF Workers secret `GOOGLE_API_KEY_1` (Phase 9.2 đã support). Lệnh: `cd worker && wrangler secret put GOOGLE_API_KEY_1`. Có thể thêm `_2`, `_3` ... đến `_5` nếu cần. Mỗi key 1 quota free riêng → bot xoay vòng tự động.
   - **/top_today endpoint** trả thêm `minScoreThreshold` + `skippedLowScore` để diagnostic.
+- **Phase 16 (Apr 29, 2026) — Diagnostic + Incident Apr 29**:
+  - **Sự cố Apr 29:** KV trống cả ngày (0/18). Root cause = TOÀN BỘ 6 AI provider trong chain đều HTTP 429. Gemini (4 provider: 2 key × 2 model) "free_tier_requests, limit: 20" exceeded; OpenRouter (Llama + Gemma free) "temporarily rate-limited upstream". Bot không tóm tắt nổi 1 bài → KV trống. Hồi phục: chờ reset quota (00:00 Pacific) HOẶC nâng paid tier Gemini / mua key OpenRouter trả phí.
+  - **Side bug phát hiện:** `MIN_SCORE_THRESHOLD = 220` quá cao — top scores hôm nay clustering quanh 218–248, chỉ ~3/137 bài qua threshold → ngay cả khi AI hồi phục, threshold vẫn chặn gần hết. Sẽ được xử lý ở task "Tự dò ngưỡng chất lượng".
+  - **`runBot` ghi `lastAiError` vào `RunResult.reason`**: dry-run / `/run` giờ lộ message thực của provider cuối (không cần `wrangler tail`).
+  - **`/top_today` thêm `topPreGate`**: top 10 bài có score cao nhất TRƯỚC khi qua MIN_SCORE_THRESHOLD + KV check → nhìn được score thực tế của batch hiện tại.
+  - **Endpoint MỚI `/diag_ai`** (cần Bearer): probe từng AI provider trên 1 article giả, KHÔNG chạm KV/Telegram/RSS. Trả `{provider, ok, ms, error}` cho từng cái — chẩn đoán "provider nào sống/chết" trong 1 request.
 - **Pipeline (Phase 1-7 upgrade)**:
   1. Fetch song song 18 nguồn → strict filter cho arxiv (chỉ paper LLM/AI)
   2. Score article: `sourceWeight + recency + keyword(boost-penalty) + primaryLab + engineering + depth − hnPenalty`
@@ -104,6 +110,8 @@ Deployed to Cloudflare Workers. Migrated từ GitHub Actions vì GH Actions cron
 - `GET /sources` — source health report, **cần Bearer**. Trả JSON liệt kê 18 nguồn + số bài fetched + ok/failed.
 - `GET /stats` — quota usage hôm nay (mỗi bucket + total), **cần Bearer**.
 - `GET /last` — bài cuối + 10 run gần nhất, **cần Bearer**.
+- `GET /top_today` — top 10 candidate hiện tại + `topPreGate` (Phase 16: top 10 trước MIN_SCORE_THRESHOLD), **cần Bearer**.
+- `GET /diag_ai` — Phase 16 diagnostic: probe từng AI provider trên 1 article giả, trả `{provider, ok, ms, error}`, **cần Bearer**. Dùng để confirm "provider nào sống/chết" mà không cần đợi cron tick.
 
 Ví dụ trigger thủ công:
 ```bash

@@ -797,3 +797,67 @@ test("ai.ProviderError: fatal flag được giữ", () => {
 test("ai.classifyHttpError: 408 → non-fatal (timeout retryable)", () => {
   assert.equal(aiTest.classifyHttpError(408).fatal, false);
 });
+
+// ────────────────────────────────────────────────────────────────────────────
+// Phase 16: probeProviders (powers /diag_ai endpoint)
+// ────────────────────────────────────────────────────────────────────────────
+
+import { probeProviders, type DiagProviderResult } from "../src/diag.ts";
+
+const stubArticle = {
+  title: "stub",
+  link: "https://example.com/x",
+  canonicalUrl: "https://example.com/x",
+  pubDate: new Date(),
+  contentSnippet: "stub content",
+  source: "stub",
+  sourceCategory: "core" as const,
+  sourcePriority: 1,
+};
+
+test("probeProviders: returns 1 entry per provider (shape contract)", async () => {
+  const providers = [
+    { name: "p1", call: async () => "result-1" },
+    { name: "p2", call: async () => "result-22" },
+  ];
+  const results: DiagProviderResult[] = await probeProviders(providers, stubArticle);
+  assert.equal(results.length, 2);
+  assert.equal(results[0].provider, "p1");
+  assert.equal(results[0].ok, true);
+  assert.equal(results[0].previewBytes, 8); // "result-1".length
+  assert.equal(results[1].provider, "p2");
+  assert.equal(results[1].ok, true);
+  assert.equal(results[1].previewBytes, 9); // "result-22".length
+  assert.equal(typeof results[0].ms, "number");
+});
+
+test("probeProviders: catches per-provider error WITHOUT breaking loop", async () => {
+  const providers = [
+    { name: "fail-first", call: async () => { throw new Error("boom 429 quota exhausted"); } },
+    { name: "still-runs", call: async () => "ok" },
+    { name: "fail-last", call: async () => { throw new Error("network down"); } },
+  ];
+  const results = await probeProviders(providers, stubArticle);
+  assert.equal(results.length, 3, "all 3 providers must be probed even when 1 throws");
+  assert.equal(results[0].ok, false);
+  assert.match(results[0].error ?? "", /boom 429 quota/);
+  assert.equal(results[1].ok, true);
+  assert.equal(results[1].previewBytes, 2);
+  assert.equal(results[2].ok, false);
+  assert.match(results[2].error ?? "", /network down/);
+});
+
+test("probeProviders: error message truncated to 400 chars", async () => {
+  const longMsg = "x".repeat(800);
+  const providers = [
+    { name: "verbose-fail", call: async () => { throw new Error(longMsg); } },
+  ];
+  const results = await probeProviders(providers, stubArticle);
+  assert.equal(results[0].ok, false);
+  assert.equal(results[0].error?.length, 400, "long errors must be truncated to 400");
+});
+
+test("probeProviders: empty provider list → empty result (no crash)", async () => {
+  const results = await probeProviders([], stubArticle);
+  assert.deepEqual(results, []);
+});
