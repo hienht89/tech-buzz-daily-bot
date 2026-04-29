@@ -53,13 +53,15 @@ Deployed to Cloudflare Workers. Migrated từ GitHub Actions vì GH Actions cron
   3. Cluster intra-batch (jaccard ≥ 0.80) — winner = source priority thấp hơn
   4. KV check exact (URL + title hash) → fuzzy check (jaccard ≥ 0.88 vs 200 title gần nhất)
   5. Bucket selection theo quota: `core 5 / ai 5 / dev 4 / research 2 / trend 2 = 18/ngày`; fallback highest score nếu mọi bucket đầy
-  6. **AI summarize chain (Phase 9)**: `{ title, bullets[], whyItMatters }` — thử lần lượt 4 provider, dừng ở cái đầu tiên thành công:
-     1. **Gemini 2.5 Flash** (Google free tier)
-     2. **Gemini 2.0 Flash** (Google free tier — fallback khi 2.5 hết quota cùng key)
-     3. **OpenRouter Llama 3.3 70B Instruct** (free model)
+  6. **AI summarize chain (Phase 9 + 9.2)**: `{ title, bullets[], whyItMatters }` — `getProviders(env)` build chain động dựa trên env, dừng ở cái đầu tiên thành công. Thứ tự:
+     1. **Gemini 2.5 Flash** (1 provider/key) — quality cao nhất, ưu tiên
+     2. **Gemini 2.0 Flash** (1 provider/key) — quota cao hơn, fallback khi 2.5 cạn
+     3. **OpenRouter Llama 3.3 70B Instruct** (free model — chỉ chạy khi có `OPENROUTER_API_KEY`)
      4. **OpenRouter Gemma 3 27B IT** (free model — provider khác để né upstream rate-limit của Llama)
 
-     HTTP `429/401/403` từ provider → coi là fatal cho provider đó, fallback ngay sang provider kế. HTTP `5xx`/timeout → retry trong cùng provider (PARSE_RETRIES=2). Provider được dùng được log + ghi vào `last_posted_v1.provider`.
+     **Key rotation (Phase 9.2)**: nếu set `GOOGLE_API_KEY_1.._5` (mỗi key 1 tài khoản Google = 1 quota free riêng), bot tạo provider riêng cho mỗi (model × key), tên thành `gemini-2.5-flash#k0`, `#k1`, ... Thứ tự: tất cả key cho 2.5-flash trước → tất cả key cho 2.0-flash → OpenRouter. Chỉ 1 key thì giữ tên cũ "gemini-2.5-flash" (backward compat).
+
+     HTTP `429/401/403` từ provider → coi là fatal cho provider đó, fallback ngay sang provider kế (run-scoped circuit breaker `Set<string> deadProviders` skip ngay ở article kế tiếp). HTTP `5xx`/`408`/timeout → retry trong cùng provider (PARSE_RETRIES=2). Provider được dùng được log + ghi vào `last_posted_v1.provider`.
   7. Sau post: ghi posted/title/recent_titles/quota/last_posted (kèm `provider`)
 - **Multi-candidate retry**: mỗi cron tick có sẵn full ranked list; nếu AI/Telegram fail bài đầu, tự thử bài tiếp theo
 - **URL normalization**: dedupe dựa trên URL ĐÃ STRIP utm_*, fbclid, gclid, ref, fragment, sort params, lowercase host

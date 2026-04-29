@@ -612,8 +612,59 @@ test("ai.classifyHttpError: 400/404 → fatal (bad request)", () => {
   assert.equal(aiTest.classifyHttpError(404).fatal, true);
 });
 
-test("ai.PROVIDERS: chain 4 provider Gemini 2.5 → 2.0 → OR-llama → OR-gemma", () => {
-  const names = aiTest.PROVIDERS.map((p: { name: string }) => p.name);
+test("ai.collectGeminiKeys: gom GOOGLE_API_KEY (k0) + _1.._5 theo thứ tự", () => {
+  assert.deepEqual(aiTest.collectGeminiKeys({} as any), []);
+  assert.deepEqual(aiTest.collectGeminiKeys({ GOOGLE_API_KEY: "a" } as any), [
+    { slug: "k0", key: "a" },
+  ]);
+  const three = aiTest.collectGeminiKeys({
+    GOOGLE_API_KEY: "a",
+    GOOGLE_API_KEY_1: "b",
+    GOOGLE_API_KEY_2: "c",
+  } as any);
+  assert.deepEqual(three, [
+    { slug: "k0", key: "a" },
+    { slug: "k1", key: "b" },
+    { slug: "k2", key: "c" },
+  ]);
+  // Skip key trống/missing nhưng giữ thứ tự
+  const sparse = aiTest.collectGeminiKeys({
+    GOOGLE_API_KEY: "a",
+    GOOGLE_API_KEY_2: "c",
+  } as any);
+  assert.deepEqual(sparse, [
+    { slug: "k0", key: "a" },
+    { slug: "k2", key: "c" },
+  ]);
+});
+
+test("ai.getProviders: chỉ 1 key Gemini → tên giữ cũ (không suffix)", () => {
+  const ps = aiTest.getProviders({ GOOGLE_API_KEY: "a" } as any);
+  const names = ps.map((p: { name: string }) => p.name);
+  assert.deepEqual(names, ["gemini-2.5-flash", "gemini-2.0-flash"]);
+});
+
+test("ai.getProviders: nhiều key Gemini → suffix #kN, ưu tiên 2.5 trước 2.0", () => {
+  const ps = aiTest.getProviders({
+    GOOGLE_API_KEY: "a",
+    GOOGLE_API_KEY_1: "b",
+  } as any);
+  const names = ps.map((p: { name: string }) => p.name);
+  // Tất cả 2.5 trước, rồi tất cả 2.0 — để xài hết quota model tốt trước
+  assert.deepEqual(names, [
+    "gemini-2.5-flash#k0",
+    "gemini-2.5-flash#k1",
+    "gemini-2.0-flash#k0",
+    "gemini-2.0-flash#k1",
+  ]);
+});
+
+test("ai.getProviders: thêm OR_KEY → 2 OR providers nối cuối chain", () => {
+  const ps = aiTest.getProviders({
+    GOOGLE_API_KEY: "a",
+    OPENROUTER_API_KEY: "or",
+  } as any);
+  const names = ps.map((p: { name: string }) => p.name);
   assert.deepEqual(names, [
     "gemini-2.5-flash",
     "gemini-2.0-flash",
@@ -622,15 +673,54 @@ test("ai.PROVIDERS: chain 4 provider Gemini 2.5 → 2.0 → OR-llama → OR-gemm
   ]);
 });
 
-test("ai.PROVIDERS.isAvailable: Gemini cần GOOGLE_API_KEY, OR cần OPENROUTER_API_KEY", () => {
-  const [g25, g20, orL, orG] = aiTest.PROVIDERS;
-  assert.equal(g25.isAvailable({ GOOGLE_API_KEY: "x" } as any), true);
-  assert.equal(g25.isAvailable({} as any), false);
-  assert.equal(g20.isAvailable({ GOOGLE_API_KEY: "x" } as any), true);
-  assert.equal(orL.isAvailable({ OPENROUTER_API_KEY: "x" } as any), true);
-  assert.equal(orL.isAvailable({} as any), false);
-  assert.equal(orG.isAvailable({ OPENROUTER_API_KEY: "x" } as any), true);
-  assert.equal(orG.isAvailable({} as any), false);
+test("ai.getProviders: env trống → 0 providers", () => {
+  assert.equal(aiTest.getProviders({} as any).length, 0);
+});
+
+test("ai.getProviders: provider names unique trong Set → circuit breaker #k0 không kill #k1", () => {
+  // Contract của circuit breaker (deadProviders Set<string> trong summarizeArticle):
+  // mỗi (key × model) phải có name riêng để mark dead 1 cái không ảnh hưởng cái kia.
+  const ps = aiTest.getProviders({
+    GOOGLE_API_KEY: "a",
+    GOOGLE_API_KEY_1: "b",
+    GOOGLE_API_KEY_2: "c",
+    OPENROUTER_API_KEY: "or",
+  } as any);
+  const names = ps.map((p: { name: string }) => p.name);
+  const unique = new Set(names);
+  assert.equal(unique.size, names.length, "tên provider phải unique");
+  // Simulate circuit breaker: mark #k0 cho cả 2 model dead → #k1, #k2 vẫn còn sống
+  const dead = new Set<string>(["gemini-2.5-flash#k0", "gemini-2.0-flash#k0"]);
+  const alive = ps.filter((p: { name: string }) => !dead.has(p.name)).map((p: { name: string }) => p.name);
+  assert.deepEqual(alive, [
+    "gemini-2.5-flash#k1",
+    "gemini-2.5-flash#k2",
+    "gemini-2.0-flash#k1",
+    "gemini-2.0-flash#k2",
+    "openrouter-llama",
+    "openrouter-gemma",
+  ]);
+});
+
+test("ai.getProviders: full chain 3 key Gemini + OR = 8 providers", () => {
+  const ps = aiTest.getProviders({
+    GOOGLE_API_KEY: "a",
+    GOOGLE_API_KEY_1: "b",
+    GOOGLE_API_KEY_2: "c",
+    OPENROUTER_API_KEY: "or",
+  } as any);
+  assert.equal(ps.length, 8);
+  const names = ps.map((p: { name: string }) => p.name);
+  assert.deepEqual(names, [
+    "gemini-2.5-flash#k0",
+    "gemini-2.5-flash#k1",
+    "gemini-2.5-flash#k2",
+    "gemini-2.0-flash#k0",
+    "gemini-2.0-flash#k1",
+    "gemini-2.0-flash#k2",
+    "openrouter-llama",
+    "openrouter-gemma",
+  ]);
 });
 
 test("ai.ProviderError: fatal flag được giữ", () => {

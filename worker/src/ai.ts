@@ -290,38 +290,75 @@ async function callOpenRouter(
 // ────────────────────────────────────────────────────────────────────────────
 
 type Provider = {
+  /** Tên provider: vd "gemini-2.5-flash#k0" hoặc "openrouter-llama". */
   name: string;
-  /** Có khả dụng không (vd thiếu API key thì skip). */
-  isAvailable: (env: Env) => boolean;
-  call: (article: Article, env: Env) => Promise<string>;
+  call: (article: Article) => Promise<string>;
 };
 
-const PROVIDERS: readonly Provider[] = [
-  {
-    name: "gemini-2.5-flash",
-    isAvailable: (env) => !!env.GOOGLE_API_KEY,
-    call: (article, env) => callGemini("gemini-2.5-flash", article, env.GOOGLE_API_KEY),
-  },
-  {
-    name: "gemini-2.0-flash",
-    isAvailable: (env) => !!env.GOOGLE_API_KEY,
-    call: (article, env) => callGemini("gemini-2.0-flash", article, env.GOOGLE_API_KEY),
-  },
-  {
-    name: "openrouter-llama",
-    isAvailable: (env) => !!env.OPENROUTER_API_KEY,
-    call: (article, env) =>
-      callOpenRouter(OPENROUTER_MODEL_LLAMA, article, env.OPENROUTER_API_KEY!),
-  },
-  {
-    // Provider thứ 4: model OpenRouter khác để khi Llama bị upstream rate-limit
-    // (free tier OpenRouter giới hạn theo model riêng) vẫn còn cửa.
-    name: "openrouter-gemma",
-    isAvailable: (env) => !!env.OPENROUTER_API_KEY,
-    call: (article, env) =>
-      callOpenRouter(OPENROUTER_MODEL_GEMMA, article, env.OPENROUTER_API_KEY!),
-  },
-];
+/**
+ * Số lượng tối đa Gemini API key phụ. Tăng nếu cần thêm key (set
+ * `GOOGLE_API_KEY_4`, `_5`, ...). Mỗi key tương ứng 1 tài khoản Google.
+ */
+const MAX_GEMINI_EXTRA_KEYS = 5;
+
+/**
+ * Gom tất cả Gemini API key có sẵn trong env, ưu tiên `GOOGLE_API_KEY` (gốc),
+ * sau đó `GOOGLE_API_KEY_1`, `_2`, ... Mỗi key sẽ tạo ra 1 provider riêng cho
+ * mỗi model Gemini → bot xoay vòng key khi 1 key cạn quota.
+ */
+function collectGeminiKeys(env: Env): Array<{ slug: string; key: string }> {
+  const keys: Array<{ slug: string; key: string }> = [];
+  if (env.GOOGLE_API_KEY) keys.push({ slug: "k0", key: env.GOOGLE_API_KEY });
+  for (let i = 1; i <= MAX_GEMINI_EXTRA_KEYS; i++) {
+    const k = (env as unknown as Record<string, string | undefined>)[`GOOGLE_API_KEY_${i}`];
+    if (k) keys.push({ slug: `k${i}`, key: k });
+  }
+  return keys;
+}
+
+/**
+ * Build provider chain động dựa trên env (số key Gemini sẵn có + có/không
+ * OpenRouter). Thứ tự ưu tiên:
+ *   1. Tất cả key của `gemini-2.5-flash` (chất lượng tốt nhất)
+ *   2. Tất cả key của `gemini-2.0-flash` (quota cao hơn, fallback)
+ *   3. OpenRouter Llama
+ *   4. OpenRouter Gemma
+ *
+ * Suffix `#kN` chỉ thêm khi có >1 key Gemini (giữ tên cũ "gemini-2.5-flash"
+ * khi chỉ có 1 key cho dễ đọc log + backward compat với last_posted cũ).
+ */
+export function getProviders(env: Env): Provider[] {
+  const providers: Provider[] = [];
+  const geminiKeys = collectGeminiKeys(env);
+  const multiKey = geminiKeys.length > 1;
+
+  for (const { slug, key } of geminiKeys) {
+    providers.push({
+      name: multiKey ? `gemini-2.5-flash#${slug}` : "gemini-2.5-flash",
+      call: (article) => callGemini("gemini-2.5-flash", article, key),
+    });
+  }
+  for (const { slug, key } of geminiKeys) {
+    providers.push({
+      name: multiKey ? `gemini-2.0-flash#${slug}` : "gemini-2.0-flash",
+      call: (article) => callGemini("gemini-2.0-flash", article, key),
+    });
+  }
+  if (env.OPENROUTER_API_KEY) {
+    const orKey = env.OPENROUTER_API_KEY;
+    providers.push({
+      name: "openrouter-llama",
+      call: (article) => callOpenRouter(OPENROUTER_MODEL_LLAMA, article, orKey),
+    });
+    providers.push({
+      // Model OpenRouter khác để khi Llama bị upstream rate-limit
+      // (free tier OpenRouter giới hạn theo model riêng) vẫn còn cửa.
+      name: "openrouter-gemma",
+      call: (article) => callOpenRouter(OPENROUTER_MODEL_GEMMA, article, orKey),
+    });
+  }
+  return providers;
+}
 
 // ────────────────────────────────────────────────────────────────────────────
 // Parse logic (không thay đổi vs phiên bản trước)
@@ -394,7 +431,8 @@ function sanitizeBullets(raw: unknown[]): string[] {
 const PARSE_RETRIES_PER_PROVIDER = 2;
 
 /**
- * Tóm tắt bài viết. Thử lần lượt từng provider trong PROVIDERS.
+ * Tóm tắt bài viết. Build provider chain từ env (xem `getProviders`) rồi thử
+ * lần lượt từng provider.
  *
  * Mỗi provider được:
  *   - thử tối đa PARSE_RETRIES_PER_PROVIDER lần để parse JSON hợp lệ
@@ -413,12 +451,12 @@ export async function summarizeArticle(
   deadProviders?: Set<string>,
 ): Promise<SummarizeResult> {
   const errors: string[] = [];
+  const providers = getProviders(env);
+  if (providers.length === 0) {
+    throw new Error("No AI provider configured (cần ít nhất GOOGLE_API_KEY hoặc OPENROUTER_API_KEY)");
+  }
 
-  for (const provider of PROVIDERS) {
-    if (!provider.isAvailable(env)) {
-      console.log(`[ai] Skip ${provider.name} — không có API key`);
-      continue;
-    }
+  for (const provider of providers) {
     if (deadProviders?.has(provider.name)) {
       console.log(`[ai] Skip ${provider.name} — đã fatal trong run này (circuit breaker)`);
       errors.push(`${provider.name}: skipped (dead)`);
@@ -431,7 +469,7 @@ export async function summarizeArticle(
 
     for (let attempt = 0; attempt < PARSE_RETRIES_PER_PROVIDER; attempt++) {
       try {
-        const raw = await provider.call(article, env);
+        const raw = await provider.call(article);
         lastRaw = raw;
         const summary = tryParseSummary(raw);
         if (summary) {
@@ -484,6 +522,7 @@ export const __test = {
   tryParseSummary,
   sanitizeBullets,
   classifyHttpError,
-  PROVIDERS,
+  collectGeminiKeys,
+  getProviders,
   ProviderError,
 };

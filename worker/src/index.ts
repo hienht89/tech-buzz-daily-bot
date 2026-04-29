@@ -41,6 +41,16 @@ export interface Env {
   TELEGRAM_CHANNEL_ID: string;
   GOOGLE_API_KEY: string;
   /**
+   * Gemini API key BỔ SUNG (mỗi key 1 tài khoản Google → 1 quota free riêng).
+   * Bot tự gom tất cả key có sẵn và xoay vòng khi 1 key cạn quota.
+   * Set tới `_5` nếu cần (xem `MAX_GEMINI_EXTRA_KEYS` trong ai.ts).
+   */
+  GOOGLE_API_KEY_1?: string;
+  GOOGLE_API_KEY_2?: string;
+  GOOGLE_API_KEY_3?: string;
+  GOOGLE_API_KEY_4?: string;
+  GOOGLE_API_KEY_5?: string;
+  /**
    * OpenRouter API key — fallback khi Gemini hết quota (HTTP 429).
    * Optional: nếu không set, bot chỉ chạy với Gemini (như hành vi cũ).
    * Đăng ký free tại openrouter.ai → Settings → Keys.

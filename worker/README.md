@@ -84,8 +84,11 @@ npx wrangler dev          # local dev (cần secrets local)
 
 ```bash
 npx wrangler secret put TELEGRAM_BOT_TOKEN
-npx wrangler secret put GOOGLE_API_KEY        # Gemini key (provider 1+2 trong chain)
-npx wrangler secret put OPENROUTER_API_KEY    # Optional — provider 3+4 (Llama/Gemma free) chỉ chạy khi có
+npx wrangler secret put GOOGLE_API_KEY        # Gemini key chính (provider 1+2 trong chain)
+# Optional: thêm key Gemini phụ để xoay vòng khi quota cạn (mỗi key = 1 tài khoản Google riêng).
+# Bot tự gom GOOGLE_API_KEY_1.._5, suffix tên thành `gemini-2.5-flash#k1` cho dễ trace.
+npx wrangler secret put GOOGLE_API_KEY_1
+npx wrangler secret put OPENROUTER_API_KEY    # Optional — fallback (Llama/Gemma free) chỉ chạy khi có
 npx wrangler secret put RUN_TRIGGER_TOKEN
 ```
 
