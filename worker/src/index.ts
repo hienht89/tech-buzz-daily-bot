@@ -6,6 +6,7 @@ import {
 import { fetchAllSources, type Article, type SourceStat } from "./rss.js";
 import { summarizeArticle } from "./ai.js";
 import { postArticle } from "./telegram.js";
+import { extractOgImage } from "./og.js";
 import {
   isPosted,
   reservePost,
@@ -237,6 +238,19 @@ async function runBotInternal(
       );
       // KHÔNG increment fail count vì lỗi không phải do bài này — do KV.
       continue;
+    }
+
+    // ───── Bước 2.5: Bù ảnh từ og:image nếu RSS không kèm ảnh ─────
+    // Lý do: nguồn như arxiv KHÔNG embed ảnh trong feed. Trước đây bot
+    // fallback về sendMessage (text-only), post trông trống. Best-effort
+    // fetch trang gốc parse <meta og:image>; thất bại → giữ nguyên (postArticle
+    // tự fallback text-only đã tắt link preview để không có title English).
+    if (!article.imageUrl) {
+      const og = await extractOgImage(article.link);
+      if (og) {
+        console.log(`${tag}   og:image found → upgrade text→photo post`);
+        article.imageUrl = og;
+      }
     }
 
     // ───── Bước 3: Post lên Telegram ─────

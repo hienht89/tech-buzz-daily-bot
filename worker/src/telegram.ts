@@ -296,6 +296,9 @@ export async function postArticle(
   summary: Summary,
   env: Env,
 ): Promise<void> {
+  // article.imageUrl được pipeline upstream (runBotInternal) bù bằng og:image
+  // crawl nếu RSS không kèm ảnh. Tới đây nếu vẫn rỗng → thật sự không có ảnh
+  // → fallback text-only (đã tắt link preview để tránh title English chèn vào).
   if (!article.imageUrl) {
     await sendTextMessage(article, summary, env);
     return;

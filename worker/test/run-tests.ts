@@ -12,6 +12,7 @@ import assert from "node:assert/strict";
 
 import { normalizeUrl } from "../src/url.ts";
 import { truncateRawByEscapedBudget } from "../src/telegram.ts";
+import { __test as ogTest } from "../src/og.ts";
 
 // ────────────────────────────────────────────────────────────────────────────
 // URL normalization (BUG #5: dedupe miss khi link có utm/fbclid khác nhau)
@@ -153,4 +154,72 @@ test("truncateRawByEscapedBudget: ellipsis added when truncated", () => {
 
 test("truncateRawByEscapedBudget: empty string", () => {
   assert.equal(truncateRawByEscapedBudget("", 100), "");
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// og:image extraction (cứu cánh khi RSS không kèm ảnh — vd arxiv)
+// ────────────────────────────────────────────────────────────────────────────
+
+test("og: extract og:image với property trước content", () => {
+  const html = `<html><head>
+    <meta property="og:image" content="https://example.com/cover.jpg">
+  </head></html>`;
+  assert.equal(ogTest.extractMetaContent(html, "og:image"), "https://example.com/cover.jpg");
+});
+
+test("og: extract og:image với content trước property (thứ tự ngược)", () => {
+  const html = `<meta content="https://cdn.com/x.png" property="og:image">`;
+  assert.equal(ogTest.extractMetaContent(html, "og:image"), "https://cdn.com/x.png");
+});
+
+test("og: extract twitter:image với name= thay vì property=", () => {
+  const html = `<meta name="twitter:image" content="https://t.com/img.jpg">`;
+  assert.equal(ogTest.extractMetaContent(html, "twitter:image"), "https://t.com/img.jpg");
+});
+
+test("og: extract single quote attribute", () => {
+  const html = `<meta property='og:image' content='https://e.com/y.jpg'>`;
+  assert.equal(ogTest.extractMetaContent(html, "og:image"), "https://e.com/y.jpg");
+});
+
+test("og: không match khi meta tag khác (priority isolation)", () => {
+  const html = `<meta property="og:title" content="Hello">`;
+  assert.equal(ogTest.extractMetaContent(html, "og:image"), undefined);
+});
+
+test("og: resolveImageUrl absolute giữ nguyên", () => {
+  assert.equal(
+    ogTest.resolveImageUrl("https://cdn.com/a.jpg", "https://example.com/post"),
+    "https://cdn.com/a.jpg",
+  );
+});
+
+test("og: resolveImageUrl relative resolve theo base", () => {
+  assert.equal(
+    ogTest.resolveImageUrl("/static/cover.jpg", "https://example.com/blog/post"),
+    "https://example.com/static/cover.jpg",
+  );
+});
+
+test("og: resolveImageUrl protocol-relative", () => {
+  assert.equal(
+    ogTest.resolveImageUrl("//cdn.com/img.jpg", "https://example.com/post"),
+    "https://cdn.com/img.jpg",
+  );
+});
+
+test("og: resolveImageUrl decode &amp; trong URL", () => {
+  assert.equal(
+    ogTest.resolveImageUrl("https://cdn.com/a.jpg?w=1&amp;h=2", "https://example.com/"),
+    "https://cdn.com/a.jpg?w=1&h=2",
+  );
+});
+
+test("og: resolveImageUrl reject non-http(s) (vd data:, javascript:)", () => {
+  assert.equal(ogTest.resolveImageUrl("javascript:alert(1)", "https://example.com/"), undefined);
+  assert.equal(ogTest.resolveImageUrl("data:image/png;base64,xxx", "https://example.com/"), undefined);
+});
+
+test("og: resolveImageUrl invalid URL → undefined (không throw)", () => {
+  assert.equal(ogTest.resolveImageUrl("", "not-a-valid-base"), undefined);
 });
