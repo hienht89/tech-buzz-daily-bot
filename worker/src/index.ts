@@ -2,18 +2,36 @@ import {
   RSS_SOURCES,
   isTechRelevantUrl,
   isTechRelevantTitle,
+  type SourceCategory,
 } from "./sources.js";
 import { fetchAllSources, type Article, type SourceStat } from "./rss.js";
 import { summarizeArticle } from "./ai.js";
 import { postArticle } from "./telegram.js";
 import { extractOgImage } from "./og.js";
+import { isRelevantArxivPaper } from "./filter.js";
+import { scoreArticle, formatBreakdown } from "./score.js";
+import { clusterBatch, checkFuzzyDuplicate } from "./dedup.js";
+import {
+  DEFAULT_QUOTA,
+  formatUsage,
+  getAllUsage,
+  incrementCategoryUsage,
+  selectFromBuckets,
+  todayKeyUTC,
+} from "./bucket.js";
 import {
   isPosted,
+  isTitlePosted,
   reservePost,
   unreservePost,
   getFailCount,
   incrementFailCount,
   clearFailCount,
+  markTitlePosted,
+  pushRecentTitle,
+  getRecentTitles,
+  setLastPosted,
+  getLastPosted,
   MAX_FAIL_BEFORE_SKIP,
 } from "./storage.js";
 
@@ -76,23 +94,30 @@ function shortRunId(): string {
 let inflightRun: Promise<RunResult> | null = null;
 
 type PickResult = {
+  /** Candidates đã qua mọi filter + dedup, sorted DESC theo score. */
   candidates: Article[];
   stats: SourceStat[];
   totalFetched: number;
   freshCount: number;
   techCount: number;
+  scoredCount: number;
+  clusteredCount: number;
 };
 
 /**
- * Lấy DANH SÁCH (không phải 1 bài) candidates đã pass mọi filter và CHƯA đăng.
- * Caller (runBot) sẽ thử từng bài cho đến khi 1 bài post thành công.
+ * Pipeline pick candidates (curated, multi-stage):
  *
- * Filter pipeline (theo thứ tự, để log chỉ rõ stage nào loại nhiều bài):
- *  1. fresh: pubDate trong 48h
- *  2. tech-relevant URL (path không match blacklist)
- *  3. tech-relevant title (không match keyword blacklist)
- *  4. chưa được đăng (KV check)
- *  5. không phải poison article (fail count < MAX)
+ *   1. fresh (≤ 48h)
+ *   2. tech-relevant URL (path blacklist)
+ *   3. tech-relevant title (keyword blacklist)
+ *   4. arxiv stricter — bài arxiv không có signal AI key thì drop
+ *   5. score everything (filter.keywordScore + score.scoreArticle)
+ *   6. event clustering (Layer 3 dedup) — gom bài cùng sự kiện, giữ winner
+ *   7. KV checks: chưa posted (URL hash), title chưa posted, không poison
+ *   8. fuzzy dedup (Layer 2) — Jaccard ≥ 0.88 với recent 200 titles
+ *   9. sort DESC theo score → trả top MAX_CANDIDATES_PER_RUN
+ *
+ * Caller (runBotInternal) sẽ chạy bucket selection trên list này.
  */
 async function pickCandidates(env: Env, runId: string): Promise<PickResult> {
   console.log(`[bot:${runId}] Fetching ${RSS_SOURCES.length} RSS sources...`);
@@ -102,29 +127,63 @@ async function pickCandidates(env: Env, runId: string): Promise<PickResult> {
   const fresh = articles.filter(isFresh);
   const techUrl = fresh.filter((a) => isTechRelevantUrl(a.link));
   const techTitle = techUrl.filter((a) => isTechRelevantTitle(a.title));
+
+  // Stage arxiv stricter — chỉ áp dụng cho source arxiv
+  const ARXIV_NAME = "arXiv cs.AI";
+  const arxivPassed = techTitle.filter(
+    (a) => a.source !== ARXIV_NAME || isRelevantArxivPaper(a.title),
+  );
+  const arxivDropped = techTitle.length - arxivPassed.length;
+
   console.log(
     `[bot:${runId}] Filter pipeline: total=${articles.length} fresh=${fresh.length} ` +
-      `tech-url=${techUrl.length} tech-title=${techTitle.length}`,
+      `tech-url=${techUrl.length} tech-title=${techTitle.length} ` +
+      `arxiv-strict-dropped=${arxivDropped} → ${arxivPassed.length}`,
   );
 
-  if (techTitle.length === 0) {
+  if (arxivPassed.length === 0) {
     return {
       candidates: [],
       stats,
       totalFetched: articles.length,
       freshCount: fresh.length,
       techCount: techTitle.length,
+      scoredCount: 0,
+      clusteredCount: 0,
     };
   }
 
-  // KV check (đã đăng) + poison check, trên TOÀN BỘ tech-relevant article
-  // (không break sớm — runBot cần list để retry).
+  // Score
+  const now = new Date();
+  for (const a of arxivPassed) {
+    a.score = scoreArticle(a, now).total;
+  }
+
+  // Layer 3 dedup: cluster intra-batch
+  const clustered = clusterBatch(arxivPassed);
+  console.log(
+    `[bot:${runId}] Event-clustering: ${arxivPassed.length} → ${clustered.length} ` +
+      `(${arxivPassed.length - clustered.length} dropped as cluster losers)`,
+  );
+
+  // Sort DESC theo score
+  clustered.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+
+  // Layer 1 + Layer 2 dedup vs KV
+  const recentTitles = await getRecentTitles(env);
   const candidates: Article[] = [];
   let skippedPosted = 0;
+  let skippedTitlePosted = 0;
   let skippedPoison = 0;
-  for (const a of techTitle) {
+  let skippedFuzzy = 0;
+
+  for (const a of clustered) {
     if (await isPosted(env, a.link)) {
       skippedPosted++;
+      continue;
+    }
+    if (await isTitlePosted(env, a.title)) {
+      skippedTitlePosted++;
       continue;
     }
     const fc = await getFailCount(env, a.link);
@@ -132,15 +191,30 @@ async function pickCandidates(env: Env, runId: string): Promise<PickResult> {
       skippedPoison++;
       continue;
     }
+    const fuzzy = checkFuzzyDuplicate(a.title, recentTitles);
+    if (fuzzy.duplicate) {
+      skippedFuzzy++;
+      console.log(
+        `[bot:${runId}]   Fuzzy dup (${fuzzy.similarity.toFixed(2)}): "${a.title.slice(0, 80)}" ≈ "${fuzzy.similarTo.slice(0, 80)}"`,
+      );
+      continue;
+    }
     candidates.push(a);
-    // Đã có đủ MAX_CANDIDATES_PER_RUN thì stop sớm (tiết kiệm KV reads)
     if (candidates.length >= MAX_CANDIDATES_PER_RUN) break;
   }
 
   console.log(
-    `[bot:${runId}] Eligible candidates: ${candidates.length} ` +
-      `(skipped: ${skippedPosted} đã đăng, ${skippedPoison} poison)`,
+    `[bot:${runId}] Eligible after dedup: ${candidates.length} ` +
+      `(skipped: ${skippedPosted} url-posted, ${skippedTitlePosted} title-posted, ` +
+      `${skippedPoison} poison, ${skippedFuzzy} fuzzy)`,
   );
+
+  // Log top scoring candidates breakdown
+  for (const a of candidates.slice(0, 3)) {
+    console.log(
+      `[bot:${runId}]   • [${a.sourceCategory}] ${formatBreakdown(scoreArticle(a, now))} — "${a.title.slice(0, 80)}" (${a.source})`,
+    );
+  }
 
   return {
     candidates,
@@ -148,6 +222,8 @@ async function pickCandidates(env: Env, runId: string): Promise<PickResult> {
     totalFetched: articles.length,
     freshCount: fresh.length,
     techCount: techTitle.length,
+    scoredCount: arxivPassed.length,
+    clusteredCount: clustered.length,
   };
 }
 
@@ -160,6 +236,32 @@ export type RunResult = {
   postedLink?: string;
   reason?: string;
 };
+
+/**
+ * Chọn candidate kế tiếp để thử, RE-CHECK bucket quota mỗi iteration.
+ *
+ * Lý do: nếu retry chỉ duyệt list đã sort 1 lần, có thể thử bài từ bucket đầy
+ * trong khi bucket khác còn slot → vi phạm quota. Bằng cách selectFromBuckets
+ * lại trên `remaining` (đã trừ tried), mỗi lần retry vẫn ưu tiên bucket-eligible
+ * trước khi rơi vào fallback.
+ *
+ * Returns null khi không còn candidate nào chưa thử.
+ */
+function nextCandidateToTry(
+  candidates: readonly Article[],
+  tried: ReadonlySet<Article>,
+  usage: Record<SourceCategory, number>,
+): { article: Article; fallback: boolean; pickedFrom: SourceCategory | "fallback" } | null {
+  const remaining = candidates.filter((c) => !tried.has(c));
+  if (remaining.length === 0) return null;
+  const sel = selectFromBuckets(remaining, usage, DEFAULT_QUOTA);
+  if (!sel.picked) return null;
+  return {
+    article: sel.picked,
+    fallback: sel.fallback,
+    pickedFrom: sel.pickedFrom ?? "fallback",
+  };
+}
 
 /**
  * Internal run. Không throw ra ngoài — mọi lỗi candidate đều được catch để
@@ -182,15 +284,44 @@ async function runBotInternal(
         ? "no fresh articles (>48h)"
         : pick.techCount === 0
           ? "no tech-relevant articles after filter"
-          : "all candidates đã đăng hoặc poison";
+          : "all candidates đã đăng / poison / dup";
     console.warn(`[bot:${runId}] No candidate to try. Reason: ${reason}`);
     return { runId, posted: false, attempted: 0, reason };
   }
 
-  for (let i = 0; i < pick.candidates.length; i++) {
-    const article = pick.candidates[i];
-    const tag = `[bot:${runId}] (${i + 1}/${pick.candidates.length})`;
-    console.log(`${tag} Trying: "${article.title}" — ${article.source}`);
+  // ───── Bucket selection — chọn theo quota ngày ─────
+  const dayKey = todayKeyUTC();
+  const usage = await getAllUsage(env, dayKey);
+  console.log(`[bot:${runId}] Bucket usage today (${dayKey}): ${formatUsage(usage)}`);
+
+  // Retry loop: mỗi iteration RE-CHECK bucket quota để chọn next candidate.
+  // Đảm bảo nếu candidate đầu fail, candidate tiếp theo vẫn ưu tiên bucket
+  // còn slot — không vô tình post từ bucket đầy khi còn bucket trống.
+  const tried = new Set<Article>();
+  let fallbackWarned = false;
+  let attempts = 0;
+  const total = pick.candidates.length;
+
+  while (true) {
+    const next = nextCandidateToTry(pick.candidates, tried, usage);
+    if (!next) break;
+    tried.add(next.article);
+    attempts++;
+
+    if (next.fallback && !fallbackWarned) {
+      console.warn(
+        `[bot:${runId}] All buckets full for today — fallback: chọn highest score chung. ` +
+          `Usage: ${formatUsage(usage)}`,
+      );
+      fallbackWarned = true;
+    }
+
+    const article = next.article;
+    const tag = `[bot:${runId}] (${attempts}/${total})`;
+    console.log(
+      `${tag} Trying [${next.pickedFrom}${next.fallback ? ", fallback" : ""}]: ` +
+        `"${article.title}" — ${article.source} [score=${article.score ?? 0}]`,
+    );
     console.log(`${tag}   Link: ${article.link}`);
 
     // Re-check posted ngay trước khi reserve — phòng race với 1 cron khác
@@ -219,7 +350,7 @@ async function runBotInternal(
       return {
         runId,
         posted: false,
-        attempted: i + 1,
+        attempted: attempts,
         postedTitle: summary.title,
         postedSource: article.source,
         postedLink: article.link,
@@ -258,11 +389,36 @@ async function runBotInternal(
       console.log(`${tag}   Posting to Telegram...`);
       await postArticle(article, summary, env);
       await clearFailCount(env, article.link).catch(() => undefined);
-      console.log(`${tag}   ✅ Posted successfully.`);
+
+      // Best-effort book-keeping. Lỗi từng bước KHÔNG được throw — bài đã
+      // post lên Telegram thành công thì run này phải coi là success.
+      await markTitlePosted(env, article.title).catch((e) =>
+        console.error(`${tag}   markTitlePosted failed: ${(e as Error).message}`),
+      );
+      await pushRecentTitle(env, article.title).catch((e) =>
+        console.error(`${tag}   pushRecentTitle failed: ${(e as Error).message}`),
+      );
+      await incrementCategoryUsage(env, article.sourceCategory, dayKey).catch((e) =>
+        console.error(`${tag}   incrementCategoryUsage failed: ${(e as Error).message}`),
+      );
+      await setLastPosted(env, {
+        title: summary.title,
+        source: article.source,
+        link: article.link,
+        category: article.sourceCategory,
+        score: article.score ?? 0,
+        postedAt: new Date().toISOString(),
+      }).catch((e) =>
+        console.error(`${tag}   setLastPosted failed: ${(e as Error).message}`),
+      );
+
+      console.log(
+        `${tag}   ✅ Posted successfully. [${article.sourceCategory}, score=${article.score ?? 0}]`,
+      );
       return {
         runId,
         posted: true,
-        attempted: i + 1,
+        attempted: attempts,
         postedTitle: summary.title,
         postedSource: article.source,
         postedLink: article.link,
@@ -299,12 +455,12 @@ async function runBotInternal(
   }
 
   console.warn(
-    `[bot:${runId}] Tried all ${pick.candidates.length} candidates, none succeeded.`,
+    `[bot:${runId}] Tried ${attempts}/${total} candidates, none succeeded.`,
   );
   return {
     runId,
     posted: false,
-    attempted: pick.candidates.length,
+    attempted: attempts,
     reason: "all candidates failed",
   };
 }
@@ -404,6 +560,60 @@ export default {
       });
     }
 
+    // ───── /stats: bucket usage hôm nay + tổng posts (cần auth) ─────
+    if (url.pathname === "/stats") {
+      if (!isAuthorized(req, env)) {
+        return new Response("Unauthorized\n", { status: 401 });
+      }
+      const dayKey = todayKeyUTC();
+      const usage = await getAllUsage(env, dayKey);
+      const totalToday =
+        usage.core + usage.ai + usage.dev + usage.research + usage.trend;
+      const totalQuota =
+        DEFAULT_QUOTA.core +
+        DEFAULT_QUOTA.ai +
+        DEFAULT_QUOTA.dev +
+        DEFAULT_QUOTA.research +
+        DEFAULT_QUOTA.trend;
+      const recent = await getRecentTitles(env);
+      const body = {
+        dayKey,
+        usage,
+        quota: DEFAULT_QUOTA,
+        totalToday,
+        totalQuota,
+        usageStr: formatUsage(usage),
+        recentTitlesCount: recent.length,
+        recentTitlesPreview: recent.slice(0, 10).map((r) => ({
+          raw: r.raw,
+          postedAt: r.postedAt,
+        })),
+        checkedAt: new Date().toISOString(),
+      };
+      return new Response(JSON.stringify(body, null, 2), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    // ───── /last: snapshot bài đăng gần nhất (cần auth) ─────
+    if (url.pathname === "/last") {
+      if (!isAuthorized(req, env)) {
+        return new Response("Unauthorized\n", { status: 401 });
+      }
+      const last = await getLastPosted(env);
+      if (!last) {
+        return new Response(
+          JSON.stringify({ message: "Chưa có bài nào được đăng (KV empty)." }, null, 2),
+          { status: 404, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return new Response(JSON.stringify(last, null, 2), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
     // ───── /run: manual trigger (cần auth) ─────
     if (url.pathname === "/run") {
       if (req.method !== "POST") {
@@ -458,7 +668,9 @@ export default {
         "  GET  /health                 — ping\n" +
         "  POST /run (Bearer)           — trigger ngay (async)\n" +
         "  POST /run?dry=1 (Bearer)     — dry-run, trả về candidate sẽ chọn (KHÔNG post)\n" +
-        "  GET  /sources (Bearer)       — source health report\n",
+        "  GET  /sources (Bearer)       — source health report\n" +
+        "  GET  /stats   (Bearer)       — bucket usage hôm nay + recent titles\n" +
+        "  GET  /last    (Bearer)       — snapshot bài đăng gần nhất\n",
       { status: 200, headers: { "Content-Type": "text/plain" } },
     );
   },

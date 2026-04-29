@@ -36,15 +36,27 @@ Telegram bot that fetches RSS tech news, summarizes with Gemini AI, and posts to
 Deployed to Cloudflare Workers. Migrated từ GitHub Actions vì GH Actions cron drift 30–60 phút vào ban đêm. Cloudflare Cron triggers fire trong vài giây của UTC scheduled time.
 
 - **Entry point**: `worker/src/index.ts` (exports `scheduled` + `fetch` handlers)
-- **Modules**: `worker/src/{rss,ai,telegram,storage,sources,url}.ts`
-- **Tests**: `worker/test/run-tests.ts` (URL normalization + HTML-safe truncation)
+- **Modules**: `worker/src/{rss,ai,telegram,storage,sources,url,filter,score,dedup,bucket}.ts`
+- **Tests**: `worker/test/run-tests.ts` — 60 unit tests (URL norm, HTML truncation, og:image, filter, score, dedup, bucket, telegram caption, ai parsing)
 - **Config**: `worker/wrangler.toml` — cron `0 0-17 * * *` UTC (= mỗi giờ 7h-0h VN, 18 lần/ngày)
 - **Storage**: Cloudflare KV namespace `POSTED_KV`
-  - `posted:<sha1(canonical_url)>` — TTL 30 ngày, ngăn dupe
-  - `failed:<sha1(canonical_url)>` — fail counter, sau 3 lần fail liên tục → đánh poison + skip 24h
-- **RSS sources**: 25 nguồn (xem `worker/src/sources.ts`) — bao gồm TechCrunch, The Verge, Ars Technica, Wired, MIT Tech Review, Hacker News, GitHub Blog, OpenAI/Anthropic/Google AI blogs, v.v.
-- **Multi-candidate retry**: mỗi cron tick thử tới 5 candidate; nếu Gemini hoặc Telegram fail bài đầu, tự thử bài tiếp theo cho đến khi post được hoặc hết
-- **URL normalization**: dedupe dựa trên URL ĐÃ STRIP utm_*, fbclid, gclid, ref, fragment, sort params, lowercase host — đảm bảo cùng 1 article xuất hiện với nhiều variant URL chỉ post 1 lần
+  - `posted:<sha1(canonical_url)>` — TTL 30 ngày, ngăn dupe URL
+  - `title:<sha1(normalized_title)>` — TTL 30 ngày, ngăn dupe title từ URL khác
+  - `recent_titles_v1` — list 200 title gần nhất cho fuzzy compare
+  - `quota:YYYY-MM-DD:<category>` — đếm bài đã post mỗi bucket trong ngày
+  - `last_posted_v1` — metadata bài cuối + run history (10 entry gần nhất)
+  - `failed:<sha1(canonical_url)>` — fail counter, sau 3 lần fail liên tục → poison 24h
+- **RSS sources**: 18 nguồn curated (xem `worker/src/sources.ts`) — chia 5 category (`core`, `ai`, `dev`, `research`, `trend`) với priority 1-3
+- **Pipeline mới (Phase 1-7 upgrade)**:
+  1. Fetch song song 18 nguồn → strict filter cho arxiv (chỉ paper LLM/AI)
+  2. Score article: `sourceWeight + recency + keyword(boost-penalty) + primaryLab + engineering + depth − hnPenalty`
+  3. Cluster intra-batch (jaccard ≥ 0.80) — winner = source priority thấp hơn
+  4. KV check exact (URL + title hash) → fuzzy check (jaccard ≥ 0.88 vs 200 title gần nhất)
+  5. Bucket selection theo quota: `core 5 / ai 5 / dev 4 / research 2 / trend 2 = 18/ngày`; fallback highest score nếu mọi bucket đầy
+  6. Gemini summarize: `{ title, bullets[], whyItMatters }` — caption render `• bullets` + `💡 Vì sao đáng đọc`
+  7. Sau post: ghi posted/title/recent_titles/quota/last_posted
+- **Multi-candidate retry**: mỗi cron tick có sẵn full ranked list; nếu Gemini/Telegram fail bài đầu, tự thử bài tiếp theo
+- **URL normalization**: dedupe dựa trên URL ĐÃ STRIP utm_*, fbclid, gclid, ref, fragment, sort params, lowercase host
 - **Bundled với** `nodejs_compat`; RSS dùng `fast-xml-parser` + `fetch` (timeout 15s); Gemini gọi qua REST API (timeout 30s)
 
 #### Required secrets (set qua `wrangler secret put`)
@@ -64,7 +76,9 @@ Deployed to Cloudflare Workers. Migrated từ GitHub Actions vì GH Actions cron
 - `GET /health` — public ping (`200 ok`)
 - `POST /run` — manual trigger ASYNC, **cần** `Authorization: Bearer <RUN_TRIGGER_TOKEN>`. Trả `202 Accepted`, chạy nền (xem log bằng `wrangler tail`).
 - `POST /run?dry=1` — dry-run SYNC: chạy pipeline đầy đủ tới Gemini summarization NHƯNG không post Telegram. Trả JSON `{ runId, posted: false, attempted, postedTitle, ... }`. Hữu ích để verify format/quality.
-- `GET /sources` — source health report, **cần Bearer**. Trả JSON liệt kê 25 nguồn + số bài fetched + ok/failed.
+- `GET /sources` — source health report, **cần Bearer**. Trả JSON liệt kê 18 nguồn + số bài fetched + ok/failed.
+- `GET /stats` — quota usage hôm nay (mỗi bucket + total), **cần Bearer**.
+- `GET /last` — bài cuối + 10 run gần nhất, **cần Bearer**.
 
 Ví dụ trigger thủ công:
 ```bash

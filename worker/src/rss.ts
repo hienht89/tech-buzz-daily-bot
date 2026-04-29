@@ -1,13 +1,24 @@
 import { XMLParser } from "fast-xml-parser";
-import type { RssSource } from "./sources.js";
+import type { RssSource, SourceCategory, SourcePriority } from "./sources.js";
+import { normalizeUrl } from "./url.js";
 
 export type Article = {
   title: string;
   link: string;
+  /** Canonical URL (utm/fbclid stripped, sorted, lowercased host). Dùng cho dedup + KV key. */
+  canonicalUrl: string;
   pubDate: Date;
   source: string;
+  /** Bucket category từ RssSource (cho bucket selection). */
+  sourceCategory: SourceCategory;
+  /** Priority 1=primary, 2=quality outlet, 3=aggregator. Dùng cho scoring + tie-break dedup. */
+  sourcePriority: SourcePriority;
   contentSnippet: string;
   imageUrl?: string;
+  /** Score sau scoring engine. Set trong score.ts, dùng cho ranking + bucket selection. */
+  score?: number;
+  /** Hash từ normalized title — dùng cho fuzzy dedup layer 2. Set trong dedup.ts. */
+  titleHash?: string;
 };
 
 const parser = new XMLParser({
@@ -252,8 +263,11 @@ export async function fetchSource(source: RssSource): Promise<Article[]> {
       articles.push({
         title,
         link,
+        canonicalUrl: normalizeUrl(link),
         pubDate: getPubDate(item),
         source: source.name,
+        sourceCategory: source.category,
+        sourcePriority: source.priority,
         contentSnippet: getContentSnippet(item),
         imageUrl: getImageUrl(item),
       });

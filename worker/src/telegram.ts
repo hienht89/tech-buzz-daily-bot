@@ -48,10 +48,25 @@ function buildSignatureLine(env: Env): string {
 }
 
 /**
- * Format caption với smart truncation:
- * - Title / takeaway / link / signature giữ nguyên vẹn (không bao giờ cắt giữa HTML tag).
- * - Chỉ cắt phần `body` (text thuần, không HTML) nếu tổng vượt maxLen.
- * - Trường hợp cực hiếm (title + takeaway + link đã quá dài), cắt link text (giữ href).
+ * Format caption với smart truncation cho schema mới (bullets + whyItMatters):
+ *
+ *   <b>title</b>
+ *
+ *   • bullet 1
+ *   • bullet 2
+ *   • bullet 3
+ *
+ *   💡 <b>Vì sao đáng đọc:</b> whyItMatters
+ *
+ *   🔗 <a href="article.link">article.link</a>
+ *
+ *   — 🐝 <b>Tech Buzz Daily</b> · @techbuzz_daily
+ *
+ * Quy tắc cắt:
+ * - Title / "Vì sao đáng đọc" / link / signature giữ nguyên vẹn.
+ * - Cắt theo thứ tự ưu tiên (cuối → đầu): bỏ bullet cuối cùng, rồi cắt
+ *   bullet còn lại bằng truncateRawByEscapedBudget.
+ * - Nếu fixed parts đã vượt budget → cắt link text (giữ href).
  */
 function formatCaption(
   article: Article,
@@ -61,57 +76,92 @@ function formatCaption(
 ): string {
   // Hard cap raw text trước khi escape, tránh Gemini trả về quá dài.
   const rawTitle = summary.title.slice(0, 150);
-  const rawTakeaway = summary.takeaway.slice(0, 280);
+  const rawWhy = summary.whyItMatters.slice(0, 320);
 
   const title = escapeHtml(rawTitle);
-  const takeaway = escapeHtml(rawTakeaway);
+  const why = escapeHtml(rawWhy);
   const linkHref = escapeHtmlAttr(article.link);
   let linkText = escapeHtml(article.link);
 
   const titleLine = `<b>${title}</b>`;
-  const takeawayLine = `💡 ${takeaway}`;
+  const whyLine = `💡 <b>Vì sao đáng đọc:</b> ${why}`;
   const signatureLine = buildSignatureLine(env);
 
   // 4 separator (mỗi cái 2 newline) = 8 chars khoảng cách
   const SEP_LEN = 8;
 
-  // Build link line, có thể cắt linkText nếu cần (giữ href nguyên vẹn)
   let linkLine = `🔗 <a href="${linkHref}">${linkText}</a>`;
-  let fixedLen = titleLine.length + takeawayLine.length + linkLine.length + signatureLine.length + SEP_LEN;
+  let fixedLen =
+    titleLine.length + whyLine.length + linkLine.length + signatureLine.length + SEP_LEN;
 
-  // Nếu fixed parts đã vượt → cắt link TEXT (KHÔNG cắt href, không bể HTML)
+  // Nếu fixed parts đã vượt → cắt link TEXT (giữ href nguyên vẹn)
   if (fixedLen >= maxLen - 30) {
-    const overhead = titleLine.length + takeawayLine.length + signatureLine.length + SEP_LEN +
-      `🔗 <a href="${linkHref}"></a>`.length + 30;
+    const overhead =
+      titleLine.length +
+      whyLine.length +
+      signatureLine.length +
+      SEP_LEN +
+      `🔗 <a href="${linkHref}"></a>`.length +
+      30;
     const linkBudget = maxLen - overhead;
     if (linkBudget > 20 && linkText.length > linkBudget) {
       linkText = linkText.slice(0, linkBudget - 3) + "...";
       linkLine = `🔗 <a href="${linkHref}">${linkText}</a>`;
-      fixedLen = titleLine.length + takeawayLine.length + linkLine.length + signatureLine.length + SEP_LEN;
+      fixedLen =
+        titleLine.length + whyLine.length + linkLine.length + signatureLine.length + SEP_LEN;
     }
   }
 
-  // Tính budget cho body, escape sau khi cắt
-  const bodyBudget = maxLen - fixedLen;
-  if (bodyBudget < 30) {
-    // Cực hiếm: không còn chỗ → bỏ body, ghép phần còn lại
-    return [titleLine, "", takeawayLine, "", linkLine, "", signatureLine].join("\n");
-  }
-  // QUAN TRỌNG: KHÔNG slice trên escaped string (có thể cắt giữa &amp; → broken HTML).
-  // Thay vào đó, binary-search độ dài raw sao cho escaped bằng đúng budget.
-  const escapedBody = truncateRawByEscapedBudget(summary.body, bodyBudget);
+  // Budget còn lại cho phần bullets (RAW, chưa escape)
+  const bulletsBudget = maxLen - fixedLen;
+  const bulletsRendered = renderBullets(summary.bullets, bulletsBudget);
 
-  return [
-    titleLine,
-    "",
-    escapedBody,
-    "",
-    takeawayLine,
-    "",
-    linkLine,
-    "",
-    signatureLine,
-  ].join("\n");
+  if (!bulletsRendered) {
+    // Cực hiếm: không đủ chỗ cho bullet nào → ghép phần còn lại
+    return [titleLine, "", whyLine, "", linkLine, "", signatureLine].join("\n");
+  }
+
+  return [titleLine, "", bulletsRendered, "", whyLine, "", linkLine, "", signatureLine].join("\n");
+}
+
+/**
+ * Render bullets thành block "• ...\n• ...". Cắt từ cuối nếu vượt budget.
+ * Trả "" nếu không bullet nào fit.
+ */
+function renderBullets(bullets: readonly string[], budget: number): string {
+  if (bullets.length === 0 || budget < 10) return "";
+  const PREFIX = "• ";
+  const NL = "\n";
+
+  // Thử full rồi giảm dần số bullet
+  for (let n = bullets.length; n >= 1; n--) {
+    const subset = bullets.slice(0, n);
+    const lines: string[] = [];
+    let remaining = budget;
+    let fits = true;
+    for (let i = 0; i < subset.length; i++) {
+      const isLast = i === subset.length - 1;
+      const sepCost = isLast ? 0 : NL.length;
+      // Cost cho 1 bullet: prefix + escaped(text) + sep
+      const escaped = escapeHtml(subset[i]);
+      const cost = PREFIX.length + escaped.length + sepCost;
+      if (cost <= remaining) {
+        lines.push(PREFIX + escaped);
+        remaining -= cost;
+      } else if (isLast && remaining > PREFIX.length + 10) {
+        // Bullet cuối được phép truncate
+        const innerBudget = remaining - PREFIX.length;
+        const truncated = truncateRawByEscapedBudget(subset[i], innerBudget);
+        lines.push(PREFIX + truncated);
+        remaining = 0;
+      } else {
+        fits = false;
+        break;
+      }
+    }
+    if (fits && lines.length > 0) return lines.join(NL);
+  }
+  return "";
 }
 
 type TelegramResponse = {
@@ -272,6 +322,13 @@ async function callApiWithRetry(
 
 const MAX_CAPTION_LEN = 1024;
 const MAX_MESSAGE_LEN = 4096;
+
+/**
+ * Helpers for testing.
+ */
+export const __test = {
+  formatCaption,
+};
 
 async function sendTextMessage(
   article: Article,

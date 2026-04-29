@@ -223,3 +223,366 @@ test("og: resolveImageUrl reject non-http(s) (vd data:, javascript:)", () => {
 test("og: resolveImageUrl invalid URL → undefined (không throw)", () => {
   assert.equal(ogTest.resolveImageUrl("", "not-a-valid-base"), undefined);
 });
+
+// ────────────────────────────────────────────────────────────────────────────
+// Phase 2: filter (keyword scoring + arxiv strict)
+// ────────────────────────────────────────────────────────────────────────────
+
+import { keywordScore, isRelevantArxivPaper } from "../src/filter.ts";
+
+test("filter.keywordScore: bài có boost keyword được +điểm, không có penalty → 0", () => {
+  const r = keywordScore("OpenAI launches GPT-5 model", "Open source release with new benchmark");
+  assert.ok(r.boost > 0, "phải có boost");
+  assert.equal(r.penalty, 0);
+});
+
+test("filter.keywordScore: bài review/leak bị penalty", () => {
+  const r = keywordScore("iPhone 17 review and leaked specs", "");
+  assert.ok(r.penalty > 0, "phải bị penalty");
+});
+
+test("filter.keywordScore: cap không vượt quá BOOST_CAP/PENALTY_CAP", () => {
+  // Dồn nhiều từ để chắc chắn vượt cap
+  const r = keywordScore(
+    "openai anthropic deepmind nvidia model launch release benchmark security vulnerability outage breach github postgres rust typescript",
+    "open source agent agentic inference training fine-tune multimodal embedding transformer",
+  );
+  assert.ok(r.boost <= 30, `boost ${r.boost} phải ≤ cap 30`);
+});
+
+test("filter.isRelevantArxivPaper: paper LLM → pass", () => {
+  assert.equal(isRelevantArxivPaper("Improving LLM reasoning with chain-of-thought"), true);
+  assert.equal(isRelevantArxivPaper("Diffusion models for video generation"), true);
+});
+
+test("filter.isRelevantArxivPaper: paper toán thuần → reject", () => {
+  assert.equal(isRelevantArxivPaper("Stochastic Gradient on Riemannian Manifolds"), false);
+  assert.equal(isRelevantArxivPaper("Bayesian inference with Monte Carlo"), false);
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// Phase 3: score
+// ────────────────────────────────────────────────────────────────────────────
+
+import { scoreArticle, formatBreakdown } from "../src/score.ts";
+import type { Article } from "../src/rss.ts";
+
+function mkArticle(over: Partial<Article> = {}): Article {
+  return {
+    title: "Sample title",
+    link: "https://example.com/post",
+    canonicalUrl: "https://example.com/post",
+    pubDate: new Date(),
+    source: "TechCrunch",
+    sourceCategory: "core",
+    sourcePriority: 2,
+    contentSnippet: "Short snippet",
+    ...over,
+  };
+}
+
+test("score: source priority 1 > 2 > 3", () => {
+  const now = new Date("2026-04-29T12:00:00Z");
+  const fixedDate = new Date("2026-04-29T11:00:00Z");
+  const a1 = scoreArticle(mkArticle({ sourcePriority: 1, pubDate: fixedDate }), now);
+  const a2 = scoreArticle(mkArticle({ sourcePriority: 2, pubDate: fixedDate }), now);
+  const a3 = scoreArticle(mkArticle({ sourcePriority: 3, pubDate: fixedDate }), now);
+  assert.ok(a1.source > a2.source, "P1 > P2");
+  assert.ok(a2.source > a3.source, "P2 > P3");
+});
+
+test("score: recency decays linearly đến 0 ở 48h", () => {
+  const now = new Date("2026-04-29T12:00:00Z");
+  const fresh = scoreArticle(mkArticle({ pubDate: now }), now);
+  const old = scoreArticle(
+    mkArticle({ pubDate: new Date(now.getTime() - 48 * 3600 * 1000) }),
+    now,
+  );
+  assert.equal(fresh.recency, 100);
+  assert.equal(old.recency, 0);
+});
+
+test("score: HN bị penalty vs source khác", () => {
+  const now = new Date();
+  const fixed = new Date(now.getTime() - 3600 * 1000);
+  const hn = scoreArticle(mkArticle({ source: "Hacker News", pubDate: fixed, sourcePriority: 3 }), now);
+  const tc = scoreArticle(mkArticle({ source: "TechCrunch", pubDate: fixed, sourcePriority: 3 }), now);
+  assert.ok(hn.hnPenalty > 0);
+  assert.ok(hn.total < tc.total, "HN total phải nhỏ hơn TechCrunch khi cùng priority");
+});
+
+test("score: primary lab boost cho OpenAI Blog", () => {
+  const now = new Date();
+  const fixed = new Date(now.getTime() - 3600 * 1000);
+  const lab = scoreArticle(
+    mkArticle({ source: "OpenAI Blog", pubDate: fixed, sourcePriority: 1 }),
+    now,
+  );
+  assert.ok(lab.primaryLab > 0);
+});
+
+test("score: depth boost khi snippet dài ≥ 500 chars", () => {
+  const now = new Date();
+  const fixed = new Date(now.getTime() - 3600 * 1000);
+  const long = "a".repeat(600);
+  const r = scoreArticle(mkArticle({ contentSnippet: long, pubDate: fixed }), now);
+  assert.ok(r.depth > 0);
+});
+
+test("score.formatBreakdown trả string có total", () => {
+  const now = new Date();
+  const r = scoreArticle(mkArticle({ pubDate: now }), now);
+  const s = formatBreakdown(r);
+  assert.match(s, /→ \d+/);
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// Phase 4: dedup
+// ────────────────────────────────────────────────────────────────────────────
+
+import {
+  normalizeTitle,
+  trigrams,
+  jaccard,
+  checkFuzzyDuplicate,
+  clusterBatch,
+  FUZZY_THRESHOLD,
+  type RecentTitleEntry,
+} from "../src/dedup.ts";
+
+test("dedup.normalizeTitle: lower + drop punctuation + drop stop word", () => {
+  const n = normalizeTitle("OpenAI's GPT-5 is launched in the US!");
+  // 'is', 'in', 'the' bị drop; apostrophe → space nên 'openai' và 's' tách ra
+  assert.equal(n, "openai s gpt 5 launched us");
+});
+
+test("dedup.trigrams + jaccard: 2 chuỗi giống nhau → ≈ 1", () => {
+  const a = trigrams("openai launches gpt5");
+  const b = trigrams("openai launches gpt5");
+  assert.equal(jaccard(a, b), 1);
+});
+
+test("dedup.jaccard: chuỗi khác hoàn toàn → thấp", () => {
+  const a = trigrams("openai launches gpt5");
+  const b = trigrams("apple unveils new mac mini");
+  assert.ok(jaccard(a, b) < 0.2, `expected low jaccard, got ${jaccard(a, b)}`);
+});
+
+test("dedup.checkFuzzyDuplicate: title gần giống recent → duplicate", () => {
+  const recentTitle = "OpenAI launches GPT-5 with improved reasoning capabilities for agents";
+  const recent: RecentTitleEntry[] = [
+    {
+      raw: recentTitle,
+      norm: normalizeTitle(recentTitle),
+      postedAt: new Date().toISOString(),
+    },
+  ];
+  // chỉ thêm 1 từ "today" → jaccard ≥ 0.88
+  const r = checkFuzzyDuplicate(
+    recentTitle + " today",
+    recent,
+  );
+  assert.equal(r.duplicate, true);
+  if (r.duplicate) assert.ok(r.similarity >= FUZZY_THRESHOLD);
+});
+
+test("dedup.checkFuzzyDuplicate: title khác → không duplicate", () => {
+  const recent: RecentTitleEntry[] = [
+    {
+      raw: "OpenAI launches GPT-5",
+      norm: normalizeTitle("OpenAI launches GPT-5"),
+      postedAt: new Date().toISOString(),
+    },
+  ];
+  const r = checkFuzzyDuplicate("Apple unveils new Mac mini", recent);
+  assert.equal(r.duplicate, false);
+});
+
+test("dedup.clusterBatch: 2 bài cùng event → giữ 1 winner (priority thấp hơn thắng)", () => {
+  // 2 title gần như identical (chỉ khác đuôi "today") → jaccard ≥ 0.80
+  const winner = mkArticle({
+    title: "OpenAI launches GPT-5 with reasoning improvements",
+    source: "OpenAI Blog",
+    sourcePriority: 1,
+    score: 200,
+  });
+  const loser = mkArticle({
+    title: "OpenAI launches GPT-5 with reasoning improvements today",
+    source: "TechCrunch",
+    sourcePriority: 2,
+    score: 150,
+  });
+  const out = clusterBatch([loser, winner]);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].source, "OpenAI Blog");
+});
+
+test("dedup.clusterBatch: 2 bài event khác nhau → giữ cả 2", () => {
+  const a = mkArticle({ title: "OpenAI launches GPT-5" });
+  const b = mkArticle({ title: "Apple unveils new Mac mini chip" });
+  const out = clusterBatch([a, b]);
+  assert.equal(out.length, 2);
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// Phase 5: bucket
+// ────────────────────────────────────────────────────────────────────────────
+
+import {
+  selectFromBuckets,
+  DEFAULT_QUOTA,
+  todayKeyUTC,
+  formatUsage,
+} from "../src/bucket.ts";
+
+test("bucket.todayKeyUTC: format YYYY-MM-DD theo UTC", () => {
+  const k = todayKeyUTC(new Date("2026-04-29T15:30:00Z"));
+  assert.equal(k, "2026-04-29");
+});
+
+test("bucket.selectFromBuckets: chọn highest score trong bucket còn quota", () => {
+  const candidates: Article[] = [
+    mkArticle({ title: "core1", sourceCategory: "core", score: 180 }),
+    mkArticle({ title: "core2", sourceCategory: "core", score: 200 }),
+    mkArticle({ title: "trend1", sourceCategory: "trend", score: 250 }),
+  ];
+  const usage = { core: 0, ai: 0, dev: 0, research: 0, trend: 0 };
+  const r = selectFromBuckets(candidates, usage);
+  assert.equal(r.fallback, false);
+  // trend1 có score cao nhất và còn quota → thắng
+  assert.equal(r.picked?.title, "trend1");
+});
+
+test("bucket.selectFromBuckets: bucket đầy → skip, chọn từ bucket khác", () => {
+  const candidates: Article[] = [
+    mkArticle({ title: "trend1", sourceCategory: "trend", score: 250 }),
+    mkArticle({ title: "core1", sourceCategory: "core", score: 200 }),
+  ];
+  // trend đã đầy 2/2 → phải chọn core1
+  const usage = { core: 0, ai: 0, dev: 0, research: 0, trend: 2 };
+  const r = selectFromBuckets(candidates, usage);
+  assert.equal(r.fallback, false);
+  assert.equal(r.picked?.title, "core1");
+});
+
+test("bucket.selectFromBuckets: tất cả bucket đầy → fallback highest score", () => {
+  const candidates: Article[] = [
+    mkArticle({ title: "low", sourceCategory: "core", score: 100 }),
+    mkArticle({ title: "high", sourceCategory: "ai", score: 300 }),
+  ];
+  const usage = { ...DEFAULT_QUOTA }; // dùng quota làm usage = đầy
+  const r = selectFromBuckets(candidates, usage);
+  assert.equal(r.fallback, true);
+  assert.equal(r.picked?.title, "high");
+});
+
+test("bucket.selectFromBuckets: empty candidates → null", () => {
+  const r = selectFromBuckets([], { core: 0, ai: 0, dev: 0, research: 0, trend: 0 });
+  assert.equal(r.picked, null);
+});
+
+test("bucket.formatUsage: hiện full marker khi đầy", () => {
+  const s = formatUsage({ core: 5, ai: 1, dev: 0, research: 0, trend: 0 });
+  assert.match(s, /core 5\/5\(full\)/);
+  assert.match(s, /ai 1\/5/);
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// Phase 6: telegram caption format mới (bullets + whyItMatters)
+// ────────────────────────────────────────────────────────────────────────────
+
+import { __test as telegramTest } from "../src/telegram.ts";
+
+test("telegram.formatCaption: render bullets + 'Vì sao đáng đọc' + link", () => {
+  const article = mkArticle({
+    title: "Original",
+    link: "https://example.com/post",
+    source: "OpenAI Blog",
+  });
+  const summary = {
+    title: "🚀 GPT-5 ra mắt",
+    bullets: ["Hỗ trợ context 10M tokens", "Reasoning tốt hơn 30%"],
+    whyItMatters: "Đặt chuẩn mới cho LLM thương mại.",
+  };
+  const env = {
+    TELEGRAM_CHANNEL_ID: "@techbuzz_daily",
+    TELEGRAM_SIGNATURE: "Tech Buzz Daily",
+    TELEGRAM_SIGNATURE_EMOJI: "🐝",
+  } as any;
+  const out = telegramTest.formatCaption(article, summary, env, 1024);
+  assert.match(out, /<b>🚀 GPT-5 ra mắt<\/b>/);
+  assert.match(out, /• Hỗ trợ context 10M tokens/);
+  assert.match(out, /• Reasoning tốt hơn 30%/);
+  assert.match(out, /Vì sao đáng đọc:/);
+  assert.match(out, /https:\/\/example\.com\/post/);
+});
+
+test("telegram.formatCaption: HTML escape trong title bullet why", () => {
+  const article = mkArticle({ link: "https://example.com/p" });
+  const summary = {
+    title: "<script>alert(1)</script>",
+    bullets: ["A & B < C"],
+    whyItMatters: "X > Y",
+  };
+  const env = { TELEGRAM_CHANNEL_ID: "@x" } as any;
+  const out = telegramTest.formatCaption(article, summary, env, 1024);
+  assert.ok(!out.includes("<script>"), "không được giữ <script> raw");
+  assert.match(out, /A &amp; B &lt; C/);
+  assert.match(out, /X &gt; Y/);
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// Phase 6: ai parsing — schema mới + backward compat schema cũ
+// ────────────────────────────────────────────────────────────────────────────
+
+import { __test as aiTest } from "../src/ai.ts";
+
+test("ai.tryParseSummary: schema mới { title, bullets, whyItMatters }", () => {
+  const raw = JSON.stringify({
+    title: "🚀 GPT-5",
+    bullets: ["bullet 1", "bullet 2"],
+    whyItMatters: "Vì sao quan trọng",
+  });
+  const r = aiTest.tryParseSummary(raw);
+  assert.ok(r);
+  assert.equal(r!.title, "🚀 GPT-5");
+  assert.equal(r!.bullets.length, 2);
+  assert.equal(r!.whyItMatters, "Vì sao quan trọng");
+});
+
+test("ai.tryParseSummary: bullets sanitize bỏ marker '-' '•' '*'", () => {
+  const raw = JSON.stringify({
+    title: "T",
+    bullets: ["- một", "• hai", "* ba"],
+    whyItMatters: "why",
+  });
+  const r = aiTest.tryParseSummary(raw);
+  assert.ok(r);
+  assert.deepEqual(r!.bullets, ["một", "hai", "ba"]);
+});
+
+test("ai.tryParseSummary: schema cũ { body, takeaway } → convert sang bullets", () => {
+  const raw = JSON.stringify({
+    title: "T",
+    body: "Câu một. Câu hai. Câu ba.",
+    takeaway: "Insight",
+  });
+  const r = aiTest.tryParseSummary(raw);
+  assert.ok(r);
+  assert.equal(r!.bullets.length, 3);
+  assert.equal(r!.whyItMatters, "Insight");
+});
+
+test("ai.tryParseSummary: code fence ```json bị strip", () => {
+  const raw = "```json\n" +
+    JSON.stringify({ title: "T", bullets: ["a"], whyItMatters: "w" }) +
+    "\n```";
+  const r = aiTest.tryParseSummary(raw);
+  assert.ok(r);
+  assert.equal(r!.title, "T");
+});
+
+test("ai.tryParseSummary: thiếu field → null", () => {
+  assert.equal(aiTest.tryParseSummary(JSON.stringify({ title: "x" })), null);
+  assert.equal(aiTest.tryParseSummary("not json"), null);
+});

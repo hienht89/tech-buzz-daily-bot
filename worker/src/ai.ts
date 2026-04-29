@@ -3,27 +3,38 @@ import type { Env } from "./index.js";
 
 const MODEL = "gemini-2.5-flash";
 
+/**
+ * Summary mới (v2):
+ *   - title: Tiêu đề tiếng Việt + emoji prefix
+ *   - bullets: 2-3 bullet ngắn gọn, mỗi bullet 1 fact key
+ *   - whyItMatters: 1 câu "Vì sao đáng đọc" — insight cho người đọc Gen Z
+ *
+ * Backward compat: legacy { title, body, takeaway } vẫn parse được — convert
+ * tự động sang format mới ở `tryParseSummary`.
+ */
 export type Summary = {
   title: string;
-  body: string;
-  takeaway: string;
+  bullets: string[];
+  whyItMatters: string;
 };
 
-const PROMPT = `Bạn là biên tập viên cho kênh Telegram "Tech Buzz Daily" — kênh tin tức công nghệ tiếng Việt với phong cách trẻ trung, năng động, hơi "lầy" nhưng vẫn chuẩn xác.
+const PROMPT = `Bạn là biên tập viên cho kênh Telegram "Tech Buzz Daily" — kênh tin tức công nghệ tiếng Việt cho dân tech, tone Gen Z: trẻ, năng động, hơi "lầy" nhưng chuẩn xác.
 
-Hãy tóm tắt bài viết tech sau đây thành nội dung tiếng Việt theo format JSON CHÍNH XÁC:
+Hãy tóm tắt bài viết tech sau đây thành tiếng Việt theo format JSON CHÍNH XÁC:
 {
-  "title": "Tiêu đề ngắn gọn, hấp dẫn bằng tiếng Việt (tối đa 100 ký tự, có thể dùng emoji ở đầu)",
-  "body": "2-3 câu tóm tắt nội dung chính, viết tự nhiên, có thể chèn từ tiếng Anh tự nhiên (như AI, GPT, model, startup...)",
-  "takeaway": "1 câu insight/điểm nhấn thú vị, ngắn gọn — tại sao tin này quan trọng hoặc đáng chú ý"
+  "title": "Tiêu đề tiếng Việt ngắn gọn, hấp dẫn (tối đa 90 ký tự). BẮT BUỘC bắt đầu bằng 1 emoji phù hợp (vd: 🚀 🤖 🧠 🛠️ 🔥 🎯 🪄 🧪 🛡️ 📱 💸).",
+  "bullets": ["2-3 bullet, mỗi bullet 1 câu ngắn gọn (≤120 ký tự), tóm tắt fact chính. KHÔNG mở đầu bằng dấu chấm, gạch ngang hay emoji — sẽ được render thành '• ...' tự động."],
+  "whyItMatters": "1 câu duy nhất (≤200 ký tự) trả lời 'Vì sao đáng đọc?' — nêu impact/insight cho dân tech Việt, không lặp lại bullet."
 }
 
 QUY TẮC:
-- Văn phong trẻ, conversational, không cứng nhắc kiểu báo chí
-- KHÔNG dịch tên riêng (OpenAI, Google, Meta, Anthropic...)
-- Có thể dùng từ tiếng Anh phổ biến (AI, model, launch, startup, demo, beta...)
-- KHÔNG bịa thông tin không có trong bài
-- TRẢ VỀ CHỈ JSON, không có text giải thích, không có markdown code fences
+- Văn phong trẻ, conversational, KHÔNG cứng nhắc kiểu báo chí.
+- KHÔNG dịch tên riêng (OpenAI, Google, Meta, Anthropic, Hugging Face...).
+- Có thể dùng từ tiếng Anh phổ biến (AI, model, launch, startup, demo, beta, agent, benchmark, fine-tune...).
+- Bullet phải có nội dung CỤ THỂ từ bài (số liệu, tên model, ngày, tên người), KHÔNG nói chung chung.
+- KHÔNG bịa thông tin ngoài bài. Nếu bài quá ngắn, làm 2 bullet thay vì 3.
+- "whyItMatters" phải là góc nhìn / hệ quả, KHÔNG được lặp y nguyên 1 bullet.
+- TRẢ VỀ CHỈ JSON hợp lệ, KHÔNG markdown code fence, KHÔNG text giải thích.
 
 Bài viết:
 Tiêu đề gốc: {{TITLE}}
@@ -123,6 +134,14 @@ async function callGemini(article: Article, apiKey: string): Promise<string> {
   throw lastErr;
 }
 
+/**
+ * Parse JSON từ Gemini. Hỗ trợ:
+ *   - Schema mới: { title, bullets[], whyItMatters }
+ *   - Schema cũ:  { title, body, takeaway } → convert sang bullets từ body
+ *     (split theo câu, lấy 2-3 câu)
+ *
+ * Sanitize bullets: bỏ marker đầu ('-', '•', '*', '·', '–', '—'), trim.
+ */
 function tryParseSummary(rawText: string): Summary | null {
   const cleaned = stripCodeFences(rawText);
   let parsed: unknown;
@@ -131,14 +150,58 @@ function tryParseSummary(rawText: string): Summary | null {
   } catch {
     return null;
   }
-  const obj = parsed as Partial<Summary>;
-  if (!obj.title || !obj.body || !obj.takeaway) return null;
-  return {
-    title: obj.title.trim(),
-    body: obj.body.trim(),
-    takeaway: obj.takeaway.trim(),
-  };
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const obj = parsed as Record<string, unknown>;
+
+  const title = typeof obj.title === "string" ? obj.title.trim() : "";
+  if (!title) return null;
+
+  // Schema mới
+  if (Array.isArray(obj.bullets) && typeof obj.whyItMatters === "string") {
+    const bullets = sanitizeBullets(obj.bullets);
+    const why = obj.whyItMatters.trim();
+    if (bullets.length === 0 || !why) return null;
+    return { title, bullets, whyItMatters: why };
+  }
+
+  // Schema cũ — fallback graceful
+  if (typeof obj.body === "string" && typeof obj.takeaway === "string") {
+    const sentences = obj.body
+      .split(/(?<=[.!?])\s+/)
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+    const bullets = sanitizeBullets(sentences.slice(0, 3));
+    const why = obj.takeaway.trim();
+    if (bullets.length === 0 || !why) return null;
+    return { title, bullets, whyItMatters: why };
+  }
+
+  return null;
 }
+
+const BULLET_MARKER_REGEX = /^[\s\-•*·–—]+/;
+const MAX_BULLETS = 3;
+const MAX_BULLET_CHARS = 220;
+
+function sanitizeBullets(raw: unknown[]): string[] {
+  const out: string[] = [];
+  for (const item of raw) {
+    if (typeof item !== "string") continue;
+    const cleaned = item.replace(BULLET_MARKER_REGEX, "").trim();
+    if (!cleaned) continue;
+    out.push(cleaned.length > MAX_BULLET_CHARS ? cleaned.slice(0, MAX_BULLET_CHARS - 1) + "…" : cleaned);
+    if (out.length >= MAX_BULLETS) break;
+  }
+  return out;
+}
+
+/**
+ * Helpers for testing.
+ */
+export const __test = {
+  tryParseSummary,
+  sanitizeBullets,
+};
 
 export async function summarizeArticle(article: Article, env: Env): Promise<Summary> {
   const maxParseRetries = 3;
