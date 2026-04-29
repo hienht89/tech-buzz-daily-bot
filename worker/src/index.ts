@@ -39,8 +39,19 @@ import {
   getRecentTitles,
   setLastPosted,
   getLastPosted,
+  pushScoreHistory,
+  getScoreHistory,
   MAX_FAIL_BEFORE_SKIP,
 } from "./storage.js";
+import {
+  computeDynamicThreshold,
+  percentileOf,
+  FALLBACK_THRESHOLD,
+  MIN_CLAMP as THRESHOLD_MIN_CLAMP,
+  MAX_CLAMP as THRESHOLD_MAX_CLAMP,
+  DEFAULT_PERCENTILE as THRESHOLD_DEFAULT_PERCENTILE,
+  MIN_HISTORY_FOR_DYNAMIC,
+} from "./threshold.js";
 import {
   incrementSkippedSlotCount,
   getSkippedSlotCount,
@@ -114,23 +125,31 @@ const MAX_AGE_HOURS = 30;
 const MAX_CANDIDATES_PER_RUN = 3;
 
 /**
- * Min score để 1 bài được coi là "đáng post" (Phase 15 → Phase 18).
- *
- * Triết lý: thà skip slot còn hơn lấp slot bằng bài rác. Nếu bài top-score
- * vẫn dưới ngưỡng này, bot SẼ KHÔNG POST trong tick đó, log
- * reason="all candidates below MIN_SCORE_THRESHOLD".
+ * Min score để 1 bài được coi là "đáng post" — TỪ TASK 7 (Apr 2026): TÍNH ĐỘNG.
  *
  * Lịch sử:
- *   - Phase 15 (Apr 28 2026): khởi đầu 220.
- *   - Phase 18 (Apr 29 2026): hạ 220 → 190.
- *     Lý do: dữ liệu thực 7 ngày qua cho thấy 220 quá cao — top scores
- *     clustering quanh 218–248, chỉ ~3% bài qua ngưỡng → quá nhiều slot
- *     bỏ trống. 190 cho phép ~50% bài qua filter trong khi vẫn loại
- *     priority 3 + recency cũ + không có boost.
+ *   - Phase 15 (Apr 28 2026): khởi đầu hard-code = 220.
+ *   - Phase 18 (Apr 29 2026): hạ 220 → 190 dựa trên data 7 ngày — top scores
+ *     clustering quanh 218–248, chỉ ~3% bài qua 220 → nhiều slot trống.
+ *   - Task 7 (Apr 2026): bỏ hard-code, tính ĐỘNG. Lý do: mỗi lần RSS đổi
+ *     hoặc keyword bonus chỉnh, ngưỡng cũ có thể quá cao (skip oan) hoặc
+ *     quá thấp (post rác) → phải edit code + redeploy. Data Phase 18 cũng
+ *     informs clamp range [180, 260].
  *
- * Có thể chỉnh xuống nếu thấy bot skip quá nhiều slot (xem `/stats` + log).
+ * Bây giờ: mỗi tick cron, bot đọc `score_history_v1` (200 score gần nhất của
+ * bài đã post) → tính `p40` → clamp về [180, 260]. Bot tự thích nghi, không
+ * cần can thiệp.
+ *
+ * Triết lý KHÔNG đổi: thà skip slot còn hơn lấp slot bằng bài rác. Khi mọi
+ * candidate < threshold động, bot sẽ KHÔNG POST trong tick đó, log reason=
+ * "all candidates below MIN_SCORE_THRESHOLD={dynamicThreshold}".
+ *
+ * Cold start (history < 20 entry): fallback về 220 — hành vi cũ, an toàn.
+ *
+ * Xem `worker/src/threshold.ts` cho công thức + comment chi tiết. Endpoint
+ * `/stats` trả về threshold hiện tại + p20/p40/p60 + history count để admin
+ * theo dõi.
  */
-const MIN_SCORE_THRESHOLD = 190;
 
 /**
  * Số slot/ngày bị skip do "all candidates below MIN_SCORE_THRESHOLD" trước
@@ -183,10 +202,12 @@ type PickResult = {
   techCount: number;
   scoredCount: number;
   clusteredCount: number;
-  /** Số bài bị skip vì score < MIN_SCORE_THRESHOLD (Phase 15). */
+  /** Số bài bị skip vì score < threshold động (Task 7). */
   skippedLowScore: number;
+  /** Threshold động đã dùng cho run này — bubble lên để log/response. */
+  minScoreThreshold: number;
   /**
-   * Top 10 article PRE-gate (sau cluster, trước MIN_SCORE_THRESHOLD + KV check).
+   * Top 10 article PRE-gate (sau cluster, trước threshold + KV check).
    * Dùng để diagnostic: nếu eligibleCount=0 mà topPreGate vẫn có bài, biết
    * ngay là threshold quá cao chứ không phải hết bài (Phase 16).
    */
@@ -208,7 +229,11 @@ type PickResult = {
  *
  * Caller (runBotInternal) sẽ chạy bucket selection trên list này.
  */
-async function pickCandidates(env: Env, runId: string): Promise<PickResult> {
+async function pickCandidates(
+  env: Env,
+  runId: string,
+  minScoreThreshold: number,
+): Promise<PickResult> {
   console.log(`[bot:${runId}] Fetching ${RSS_SOURCES.length} RSS sources...`);
   const { articles, stats } = await fetchAllSources(RSS_SOURCES);
   console.log(`[bot:${runId}] Fetched ${articles.length} articles (top-N after sort)`);
@@ -240,6 +265,7 @@ async function pickCandidates(env: Env, runId: string): Promise<PickResult> {
       scoredCount: 0,
       clusteredCount: 0,
       skippedLowScore: 0,
+      minScoreThreshold,
       topPreGate: [],
     };
   }
@@ -291,10 +317,10 @@ async function pickCandidates(env: Env, runId: string): Promise<PickResult> {
       );
       continue;
     }
-    // Min-score gate (Phase 15) — thà skip slot còn hơn post bài rác.
+    // Min-score gate (Task 7: dynamic) — thà skip slot còn hơn post bài rác.
     // Vì `clustered` đã sort DESC theo score, gặp bài đầu tiên dưới ngưỡng
     // → tất cả bài còn lại cũng dưới ngưỡng → break sớm.
-    if ((a.score ?? 0) < MIN_SCORE_THRESHOLD) {
+    if ((a.score ?? 0) < minScoreThreshold) {
       skippedLowScore++;
       // Không break ngay vì có thể có 1-2 bài score thấp xen giữa do
       // dedup loại các bài score cao hơn — nhưng đã sort DESC nên break
@@ -309,7 +335,7 @@ async function pickCandidates(env: Env, runId: string): Promise<PickResult> {
     `[bot:${runId}] Eligible after dedup: ${candidates.length} ` +
       `(skipped: ${skippedPosted} url-posted, ${skippedTitlePosted} title-posted, ` +
       `${skippedPoison} poison, ${skippedFuzzy} fuzzy, ` +
-      `${skippedLowScore} below MIN_SCORE_THRESHOLD=${MIN_SCORE_THRESHOLD})`,
+      `${skippedLowScore} below MIN_SCORE_THRESHOLD=${minScoreThreshold} [dynamic])`,
   );
 
   // Log top scoring candidates breakdown
@@ -328,6 +354,7 @@ async function pickCandidates(env: Env, runId: string): Promise<PickResult> {
     scoredCount: arxivPassed.length,
     clusteredCount: clustered.length,
     skippedLowScore,
+    minScoreThreshold,
     topPreGate: clustered.slice(0, 10),
   };
 }
@@ -398,6 +425,7 @@ async function maybeAlertSkippedSlot(
   env: Env,
   runId: string,
   skippedLowScore: number,
+  minScoreThreshold: number,
 ): Promise<number> {
   const dayKey = todayKeyUTC();
   let newCount: number;
@@ -445,10 +473,11 @@ async function maybeAlertSkippedSlot(
   const text =
     `⚠️ <b>Tech Buzz Daily — cảnh báo chất lượng</b>\n\n` +
     `Hôm nay (${dayKey}, UTC) bot đã <b>bỏ qua ${newCount} slot</b> vì không có bài nào ` +
-    `score ≥ <b>${MIN_SCORE_THRESHOLD}</b>.\n\n` +
+    `score ≥ <b>${minScoreThreshold}</b> (threshold động — Task 7).\n\n` +
     `Tick gần nhất có ${skippedLowScore} bài bị skip do score thấp.\n\n` +
-    `Có thể do nguồn RSS hôm nay yếu hoặc <code>MIN_SCORE_THRESHOLD</code> đặt quá cao. ` +
-    `Kiểm tra <code>/top_today</code> xem điểm thực tế và cân nhắc chỉnh ngưỡng.`;
+    `Có thể do nguồn RSS hôm nay yếu, hoặc threshold động đang bám p40 history ở mức ` +
+    `cao. Kiểm tra <code>/stats</code> xem threshold hiện tại + p20/p40/p60 và ` +
+    `<code>/top_today</code> xem điểm thực tế của batch.`;
   const sent = await sendAdminAlert(env, text);
   if (sent) {
     console.log(
@@ -474,6 +503,36 @@ async function maybeAlertSkippedSlot(
 }
 
 /**
+ * Đọc score history từ KV → tính threshold động (Task 7).
+ *
+ * KV read fail (vd binding tạm down, transient 5xx) KHÔNG bao giờ làm runBot
+ * crash — fallback về `FALLBACK_THRESHOLD = 220` (hành vi cũ trước Task 7).
+ * Bot có thể chạy "blind" 1 tick còn hơn skip vì lỗi cơ sở hạ tầng.
+ *
+ * Tách thành function riêng để: (a) tái sử dụng được trong endpoint /stats và
+ * /top_today, (b) test được mà không phải mock cả runBotInternal.
+ */
+async function resolveDynamicThreshold(env: Env, runId: string): Promise<number> {
+  let history;
+  try {
+    history = await getScoreHistory(env);
+  } catch (err) {
+    console.error(
+      `[bot:${runId}] Đọc score_history_v1 fail (${(err as Error).message?.slice(0, 200)}). ` +
+        `Fallback threshold ${FALLBACK_THRESHOLD}.`,
+    );
+    return FALLBACK_THRESHOLD;
+  }
+  const threshold = computeDynamicThreshold(history);
+  const isFallback = history.length < MIN_HISTORY_FOR_DYNAMIC;
+  console.log(
+    `[bot:${runId}] Dynamic threshold = ${threshold} ` +
+      `(history=${history.length}, ${isFallback ? "FALLBACK (cold start)" : "p40 clamped to [" + THRESHOLD_MIN_CLAMP + "," + THRESHOLD_MAX_CLAMP + "]"})`,
+  );
+  return threshold;
+}
+
+/**
  * Internal run. Không throw ra ngoài — mọi lỗi candidate đều được catch để
  * tiếp tục thử bài tiếp theo. Cron handler không bao giờ thấy exception.
  */
@@ -485,7 +544,11 @@ async function runBotInternal(
   const dry = !!options.dryRun;
   console.log(`[bot:${runId}] Run started${dry ? " (DRY RUN — sẽ KHÔNG post)" : ""}`);
 
-  const pick = await pickCandidates(env, runId);
+  // Task 7: tự dò threshold động từ score history. KV read fail → fallback
+  // (tránh để 1 KV hiccup làm cả run đứng).
+  const minScoreThreshold = await resolveDynamicThreshold(env, runId);
+
+  const pick = await pickCandidates(env, runId, minScoreThreshold);
 
   if (pick.candidates.length === 0) {
     const isLowScoreSkip =
@@ -497,7 +560,7 @@ async function runBotInternal(
         : pick.techCount === 0
           ? "no tech-relevant articles after filter"
           : isLowScoreSkip
-            ? `all candidates below MIN_SCORE_THRESHOLD=${MIN_SCORE_THRESHOLD} ` +
+            ? `all candidates below MIN_SCORE_THRESHOLD=${minScoreThreshold} [dynamic] ` +
               `(${pick.skippedLowScore} bài bị skip vì score thấp) — slot bỏ trống ưu tiên chất lượng`
             : "all candidates đã đăng / poison / dup";
     console.warn(`[bot:${runId}] No candidate to try. Reason: ${reason}`);
@@ -510,7 +573,7 @@ async function runBotInternal(
     // Bỏ qua khi `dryRun` để admin curl `/run?dry=1` test thoải mái mà không
     // bị spam alert hay làm sai counter ngày thật.
     if (isLowScoreSkip && !dry) {
-      await maybeAlertSkippedSlot(env, runId, pick.skippedLowScore);
+      await maybeAlertSkippedSlot(env, runId, pick.skippedLowScore, minScoreThreshold);
     }
 
     return { runId, posted: false, attempted: 0, reason };
@@ -656,6 +719,13 @@ async function runBotInternal(
           op: () => incrementCategoryUsage(env, article.sourceCategory, dayKey),
         },
         { name: "setLastPosted", op: () => setLastPosted(env, lastPostedPayload) },
+        // Task 7: feed score vào history để threshold tự thích nghi tick sau.
+        // Pass NaN khi score undefined → pushScoreHistory tự skip (no-op),
+        // tránh ô nhiễm history bằng 0 giả tạo.
+        {
+          name: "pushScoreHistory",
+          op: () => pushScoreHistory(env, article.score ?? Number.NaN),
+        },
       ]);
       const sum = summarizeKvResults(kvWrites);
       if (sum.failCount === 0) {
@@ -858,6 +928,29 @@ export default {
         DEFAULT_QUOTA.trend;
       const recent = await getRecentTitles(env);
       const skippedSlotCount = await getSkippedSlotCount(env.POSTED_KV, dayKey);
+
+      // Task 7: dynamic threshold + percentile snapshot. Đọc lại history (KV
+      // read rẻ — 1 entry JSON ~10KB max) thay vì cache: đảm bảo /stats luôn
+      // phản ánh đúng KV hiện tại, không bị stale do cron tick chưa fire.
+      const scoreHistory = await getScoreHistory(env);
+      const scores = scoreHistory.map((e) => e.score);
+      const currentThreshold = computeDynamicThreshold(scoreHistory);
+      const isFallback = scoreHistory.length < MIN_HISTORY_FOR_DYNAMIC;
+      const thresholdInfo = {
+        current: currentThreshold,
+        mode: isFallback ? ("fallback" as const) : ("dynamic" as const),
+        fallback: FALLBACK_THRESHOLD,
+        clamp: { min: THRESHOLD_MIN_CLAMP, max: THRESHOLD_MAX_CLAMP },
+        percentile: THRESHOLD_DEFAULT_PERCENTILE,
+        minHistoryForDynamic: MIN_HISTORY_FOR_DYNAMIC,
+        historyCount: scoreHistory.length,
+        // Round percentile values cho dễ đọc — full float vô nghĩa với điểm
+        // nguyên (score luôn nguyên).
+        p20: scores.length > 0 ? Math.round(percentileOf(scores, 0.2)) : null,
+        p40: scores.length > 0 ? Math.round(percentileOf(scores, 0.4)) : null,
+        p60: scores.length > 0 ? Math.round(percentileOf(scores, 0.6)) : null,
+      };
+
       const body = {
         dayKey,
         usage,
@@ -870,6 +963,8 @@ export default {
         // skippedSlotCount >= alertThreshold (xem maybeAlertSkippedSlot).
         skippedSlotCount,
         skippedSlotAlertThreshold: SKIP_ALERT_THRESHOLD,
+        // Task 7: threshold động + phân phối p20/p40/p60 + history count.
+        threshold: thresholdInfo,
         recentTitlesCount: recent.length,
         recentTitlesPreview: recent.slice(0, 10).map((r) => ({
           raw: r.raw,
@@ -911,7 +1006,11 @@ export default {
       }
       const runId = shortRunId();
       try {
-        const pick = await pickCandidates(env, runId);
+        // Task 7: dùng cùng dynamic threshold như runBotInternal — endpoint
+        // này phải trả về CHÍNH XÁC kết quả pickCandidates sẽ làm khi cron
+        // chạy ngay bây giờ (thay vì áp ngưỡng cố định 220).
+        const minScoreThreshold = await resolveDynamicThreshold(env, runId);
+        const pick = await pickCandidates(env, runId, minScoreThreshold);
         const now = new Date();
         const mapArticle = (a: Article) => ({
           title: a.title,
@@ -924,9 +1023,9 @@ export default {
           breakdown: scoreArticle(a, now),
         });
         const top = pick.candidates.slice(0, 10).map(mapArticle);
-        // Phase 16 diagnostic: top 10 PRE-gate (trước MIN_SCORE_THRESHOLD + KV
-        // check). Cho phép admin nhìn thấy điểm thực tế của batch hiện tại
-        // → chỉnh threshold cho hợp lý nếu eligibleCount=0 do threshold quá cao.
+        // Phase 16 diagnostic: top 10 PRE-gate (trước threshold + KV check).
+        // Cho phép admin nhìn thấy điểm thực tế của batch hiện tại → chỉnh
+        // history nếu eligibleCount=0 do threshold quá cao.
         const topPreGate = pick.topPreGate.map(mapArticle);
         const body = {
           runId,
@@ -936,7 +1035,7 @@ export default {
           scoredCount: pick.scoredCount,
           clusteredCount: pick.clusteredCount,
           eligibleCount: pick.candidates.length,
-          minScoreThreshold: MIN_SCORE_THRESHOLD,
+          minScoreThreshold,
           skippedLowScore: pick.skippedLowScore,
           top,
           topPreGate,
@@ -1103,7 +1202,7 @@ export default {
         "  POST /run?dry=1 (Bearer)      — dry-run, trả về candidate sẽ chọn (KHÔNG post)\n" +
         "  POST /force_fetch (Bearer)    — alias của /run\n" +
         "  GET  /sources   (Bearer)      — source health report\n" +
-        "  GET  /stats     (Bearer)      — bucket usage hôm nay + recent titles\n" +
+        "  GET  /stats     (Bearer)      — bucket usage hôm nay + threshold động (Task 7) + recent titles\n" +
         "  GET  /last      (Bearer)      — snapshot bài đăng gần nhất\n" +
         "  GET  /top_today (Bearer)      — top 10 candidate eligible + topPreGate (top 10 trước MIN_SCORE_THRESHOLD)\n" +
         "  GET  /diag_ai   (Bearer)      — Phase 16: probe từng AI provider, trả {provider, ok, ms, error}\n" +

@@ -211,3 +211,67 @@ export async function getLastPosted(env: Env): Promise<LastPostedSnapshot | null
     return null;
   }
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Score history (Task 7) — input cho dynamic threshold
+//
+// Lưu score của những bài ĐÃ POST thành công vào KV. Caller dùng phân phối
+// này (qua `computeDynamicThreshold` trong threshold.ts) để tự dò ngưỡng
+// chất lượng — không còn phải hard-code 220.
+//
+// KV layout:
+//   key   = `score_history_v1`
+//   value = JSON array of ScoreHistoryEntry, MỚI Ở ĐẦU, cap SCORE_HISTORY_CAP
+//   TTL   = không có (giữ vĩnh viễn — cap đảm bảo size không phình)
+//
+// Tại sao 200 entry? Bot chạy ~9 tick/ngày (xem cron). 200 entry ≈ 22 ngày
+// — đủ smoothing qua tuần, không quá ngắn để bị 1 buổi tệ làm lệch p40.
+// Task chỉ yêu cầu "7 ngày qua" nhưng cap rộng hơn cho đỡ ZIG-ZAG. Caller
+// có thể slice bớt nếu cần.
+// ────────────────────────────────────────────────────────────────────────────
+
+const SCORE_HISTORY_KEY = "score_history_v1";
+export const SCORE_HISTORY_CAP = 200;
+
+export type ScoreHistoryEntry = {
+  /** Total score của bài (đã ghi tại lúc post — không re-compute). */
+  score: number;
+  postedAt: string;
+};
+
+export async function getScoreHistory(env: Env): Promise<ScoreHistoryEntry[]> {
+  const raw = await env.POSTED_KV.get(SCORE_HISTORY_KEY);
+  if (!raw) return [];
+  try {
+    const arr = JSON.parse(raw) as unknown;
+    if (!Array.isArray(arr)) return [];
+    return arr.filter(
+      (e): e is ScoreHistoryEntry =>
+        typeof e === "object" &&
+        e !== null &&
+        typeof (e as ScoreHistoryEntry).score === "number" &&
+        Number.isFinite((e as ScoreHistoryEntry).score) &&
+        typeof (e as ScoreHistoryEntry).postedAt === "string",
+    );
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Push 1 score vào đầu list, cap về SCORE_HISTORY_CAP. Cũng giống
+ * `pushRecentTitle`, không atomic giữa get + put — chấp nhận được vì cron
+ * single-flight + chỉ gọi sau khi post thành công (rất hiếm race thực tế).
+ *
+ * Bỏ qua score không hữu hạn (NaN, ±Inf) thay vì làm bẩn KV.
+ */
+export async function pushScoreHistory(env: Env, score: number): Promise<void> {
+  if (!Number.isFinite(score)) return;
+  const list = await getScoreHistory(env);
+  const entry: ScoreHistoryEntry = {
+    score,
+    postedAt: new Date().toISOString(),
+  };
+  const next = [entry, ...list].slice(0, SCORE_HISTORY_CAP);
+  await env.POSTED_KV.put(SCORE_HISTORY_KEY, JSON.stringify(next));
+}

@@ -1329,6 +1329,148 @@ test("getSkippedSlotCount: empty / missing → 0", async () => {
   assert.equal(await getSkippedSlotCount(kv, "2026-05-01"), 0);
 });
 
+// ────────────────────────────────────────────────────────────────────────────
+// Task 7: dynamic threshold (computeDynamicThreshold + percentileOf)
+// ────────────────────────────────────────────────────────────────────────────
+
+import {
+  computeDynamicThreshold,
+  percentileOf,
+  FALLBACK_THRESHOLD,
+  MIN_CLAMP as THRESHOLD_MIN_CLAMP,
+  MAX_CLAMP as THRESHOLD_MAX_CLAMP,
+  DEFAULT_PERCENTILE,
+  MIN_HISTORY_FOR_DYNAMIC,
+} from "../src/threshold.ts";
+
+test("percentileOf: empty array → 0", () => {
+  assert.equal(percentileOf([], 0.5), 0);
+});
+
+test("percentileOf: single value → trả luôn value đó với mọi p", () => {
+  assert.equal(percentileOf([42], 0), 42);
+  assert.equal(percentileOf([42], 0.5), 42);
+  assert.equal(percentileOf([42], 1), 42);
+});
+
+test("percentileOf: R-7 linear interpolation (Excel PERCENTILE.INC)", () => {
+  // [10, 20, 30, 40, 50] — n=5, n-1=4
+  const v = [10, 20, 30, 40, 50];
+  // p=0 → idx=0 → 10
+  assert.equal(percentileOf(v, 0), 10);
+  // p=1 → idx=4 → 50
+  assert.equal(percentileOf(v, 1), 50);
+  // p=0.5 → idx=2 → 30 (median)
+  assert.equal(percentileOf(v, 0.5), 30);
+  // p=0.25 → idx=1 → 20
+  assert.equal(percentileOf(v, 0.25), 20);
+  // p=0.4 → idx=1.6 → 20 + 0.6*(30-20) = 26
+  assert.equal(percentileOf(v, 0.4), 26);
+});
+
+test("percentileOf: unsorted input → tự sort, không phụ thuộc thứ tự caller", () => {
+  const a = percentileOf([50, 10, 30, 20, 40], 0.4);
+  const b = percentileOf([10, 20, 30, 40, 50], 0.4);
+  assert.equal(a, b);
+});
+
+test("percentileOf: clamp p về [0,1] — caller pass nhầm 40 không crash", () => {
+  // p=40 (out-of-range) clamp về 1 → trả max
+  assert.equal(percentileOf([10, 20, 30], 40), 30);
+  // p=-1 clamp về 0 → trả min
+  assert.equal(percentileOf([10, 20, 30], -1), 10);
+});
+
+test("percentileOf: skip NaN/Inf trong input", () => {
+  // [10, NaN, 20, Inf, 30] → [10, 20, 30] sau filter → median = 20
+  assert.equal(percentileOf([10, NaN, 20, Infinity, 30], 0.5), 20);
+});
+
+test("percentileOf: tất cả input đều NaN → 0", () => {
+  assert.equal(percentileOf([NaN, Infinity, -Infinity], 0.5), 0);
+});
+
+test("computeDynamicThreshold: history < MIN_HISTORY_FOR_DYNAMIC → fallback 220", () => {
+  // 0 entry → fallback
+  assert.equal(computeDynamicThreshold([]), FALLBACK_THRESHOLD);
+  // 19 entry (vẫn dưới MIN=20) → fallback dù phân phối nói khác
+  const sparse = Array.from({ length: 19 }, (_, i) => ({ score: 100 + i }));
+  assert.equal(computeDynamicThreshold(sparse), FALLBACK_THRESHOLD);
+  assert.ok(MIN_HISTORY_FOR_DYNAMIC === 20, "MIN_HISTORY_FOR_DYNAMIC kỳ vọng = 20");
+});
+
+test("computeDynamicThreshold: history ≥ MIN → tính p40, clamp về [180, 260]", () => {
+  // 25 entry phân phối đều quanh 220-260 → p40 nằm trong clamp range
+  const hist = Array.from({ length: 25 }, (_, i) => ({ score: 200 + i * 2 })); // 200..248
+  const t = computeDynamicThreshold(hist);
+  assert.ok(t >= THRESHOLD_MIN_CLAMP && t <= THRESHOLD_MAX_CLAMP,
+    `threshold ${t} phải nằm trong clamp [${THRESHOLD_MIN_CLAMP}, ${THRESHOLD_MAX_CLAMP}]`);
+  // sanity: với input 200..248, p40 ≈ 200 + 0.4*48 = 219.2 → round 219
+  assert.equal(t, 219);
+});
+
+test("computeDynamicThreshold: clamp dưới khi p40 quá thấp", () => {
+  // 30 entry toàn score < 180 → p40 sẽ < 180 → clamp lên 180
+  const lowHist = Array.from({ length: 30 }, (_, i) => ({ score: 50 + i })); // 50..79
+  const t = computeDynamicThreshold(lowHist);
+  assert.equal(t, THRESHOLD_MIN_CLAMP, `clamp dưới phải kéo lên ${THRESHOLD_MIN_CLAMP}`);
+});
+
+test("computeDynamicThreshold: clamp trên khi p40 quá cao", () => {
+  // 30 entry toàn score > 260 → p40 sẽ > 260 → clamp xuống 260
+  const highHist = Array.from({ length: 30 }, (_, i) => ({ score: 300 + i })); // 300..329
+  const t = computeDynamicThreshold(highHist);
+  assert.equal(t, THRESHOLD_MAX_CLAMP, `clamp trên phải kéo xuống ${THRESHOLD_MAX_CLAMP}`);
+});
+
+test("computeDynamicThreshold: percentile arg overrides default", () => {
+  // 25 entry 200..248 → p20 ≈ 200 + 0.2*48 = 209.6 → round 210
+  const hist = Array.from({ length: 25 }, (_, i) => ({ score: 200 + i * 2 }));
+  const tDefault = computeDynamicThreshold(hist); // p40
+  const tP20 = computeDynamicThreshold(hist, 0.2);
+  assert.ok(tP20 < tDefault, `p20 (${tP20}) phải < p40 (${tDefault})`);
+});
+
+test("computeDynamicThreshold: default param dùng đúng DEFAULT_PERCENTILE", () => {
+  const hist = Array.from({ length: 50 }, (_, i) => ({ score: 200 + i * 2 }));
+  const tDefault = computeDynamicThreshold(hist);
+  const tExplicit = computeDynamicThreshold(hist, DEFAULT_PERCENTILE);
+  assert.equal(tDefault, tExplicit);
+});
+
+test("computeDynamicThreshold: output luôn integer (round)", () => {
+  // 21 entry → p40 ≈ giá trị lẻ → cần round
+  const hist = Array.from({ length: 21 }, (_, i) => ({ score: 200 + i })); // 200..220
+  const t = computeDynamicThreshold(hist);
+  assert.equal(t, Math.round(t), "threshold phải là integer");
+});
+
+test("computeDynamicThreshold: output stable không phụ thuộc thứ tự history", () => {
+  const sorted = Array.from({ length: 30 }, (_, i) => ({ score: 200 + i }));
+  const reversed = [...sorted].reverse();
+  const shuffled = [...sorted].sort(() => 0.5 - Math.random());
+  assert.equal(computeDynamicThreshold(sorted), computeDynamicThreshold(reversed));
+  assert.equal(computeDynamicThreshold(sorted), computeDynamicThreshold(shuffled));
+});
+
+test("computeDynamicThreshold: history exactly = MIN_HISTORY_FOR_DYNAMIC → dynamic mode (boundary)", () => {
+  // Kỳ vọng ranh giới `< MIN` (không `≤`): 20 entry phải KÍCH HOẠT dynamic.
+  const hist = Array.from({ length: MIN_HISTORY_FOR_DYNAMIC }, (_, i) => ({ score: 240 + i }));
+  const t = computeDynamicThreshold(hist);
+  // Với 240..259, p40 = 240 + 0.4*19 = 247.6 → round 248 → trong clamp
+  // → KHÔNG phải fallback 220
+  assert.notEqual(t, FALLBACK_THRESHOLD, "boundary: 20 entry kích hoạt dynamic mode");
+  assert.equal(t, 248);
+});
+
+// Note: pushScoreHistory / getScoreHistory ở storage.ts KHÔNG có unit-test
+// trực tiếp — cùng lý do với các helper KV khác trong storage.ts (xem comment
+// trong skipCounter.ts): import storage.ts kéo theo url.js + dedup.js cần
+// transpile thành .ts → strip-types loader của Node không tự rewrite .js→.ts.
+// Hợp đồng `pushScoreHistory`/`getScoreHistory` mirror đúng `pushRecentTitle`/
+// `getRecentTitles` (đã production-tested), test percentile + clamp ở trên đã
+// cover phần phức tạp duy nhất.
+
 test("wasAdminAlertSent / markAdminAlertSent: flag flow + TTL + day-isolation", async () => {
   const store = new Map<string, string>();
   let lastTtl: number | undefined;
