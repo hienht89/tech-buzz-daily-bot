@@ -1,0 +1,324 @@
+Bạn là senior software engineer + AI engineer + SRE. Nhiệm vụ của bạn là biến bot Telegram RSS hiện tại của tôi thành một hệ thống curated news bot thông minh, tự động, chất lượng cao, production-ready.
+
+========================================
+🎯 MỤC TIÊU CUỐI
+================
+
+Bot không phải là RSS repost bot.
+
+Bot phải:
+
+* tự tìm bài viết hay
+* tự đánh giá chất lượng
+* tự lọc bài kém
+* tự chống trùng (duplicate + event-level)
+* tự tóm tắt + dịch sang tiếng Việt
+* tự đăng lên Telegram theo chiến lược hợp lý
+* không spam
+* có logging đầy đủ
+* có khả năng tự mở rộng nguồn theo thời gian
+
+Bot phải hoạt động như một AI curator.
+
+========================================
+📡 NGUỒN DỮ LIỆU (HYBRID)
+=========================
+
+I. CORE TRUSTED SOURCES (BẮT BUỘC GIỮ)
+
+TECH:
+
+* https://techcrunch.com/feed/
+* https://www.theverge.com/rss/tech/index.xml
+* https://www.wired.com/feed/rss
+* https://feeds.arstechnica.com/arstechnica/index
+* https://feeds.bbci.co.uk/news/technology/rss.xml
+
+AI:
+
+* https://openai.com/news/rss.xml
+* https://blog.google/technology/ai/rss/
+* https://deepmind.google/blog/rss.xml
+* https://huggingface.co/blog/feed.xml
+* https://www.anthropic.com/news/rss.xml
+* https://ai.facebook.com/blog/rss/
+* http://export.arxiv.org/rss/cs.AI
+
+DEV:
+
+* https://github.blog/feed/
+* https://stackoverflow.blog/feed/
+* https://feed.infoq.com/
+* https://netflixtechblog.com/feed
+
+TREND:
+
+* https://hnrss.org/frontpage?points=120
+* https://paperswithcode.com/rss
+
+---
+
+II. DYNAMIC SOURCE DISCOVERY (QUAN TRỌNG)
+
+Bot KHÔNG chỉ dùng RSS cố định.
+
+Phải tự tìm nguồn mới từ:
+
+* Hacker News links
+* Papers with Code references
+* các domain xuất hiện nhiều lần trong bài chất lượng cao
+* engineering blogs (Stripe, Cloudflare, Vercel, Uber, etc.)
+* AI labs, research blogs
+
+Phải xây dựng:
+
+* candidate_sources
+* trusted_sources
+* blocked_sources
+
+Nguồn mới:
+
+* KHÔNG được đăng ngay
+* phải qua evaluation pipeline
+
+========================================
+🧠 PIPELINE XỬ LÝ (BẮT BUỘC)
+============================
+
+1. FETCH
+
+* fetch tất cả RSS
+* timeout riêng
+* retry có giới hạn
+* không crash toàn hệ thống nếu 1 feed lỗi
+
+2. NORMALIZE
+   Chuẩn hóa article:
+
+* id
+* source_name
+* domain
+* source_category
+* source_type (core | dynamic)
+* title
+* normalized_title
+* url
+* canonical_url
+* published_at
+* summary
+* content_snippet
+* fetched_at
+
+3. PRE-FILTER
+   Loại bỏ:
+
+* title rỗng
+* bài quá cũ
+* thiếu link
+* spam content
+* deal / coupon / affiliate
+
+4. DOMAIN TRUST SCORING
+
+Mỗi domain có điểm:
+
+* official AI lab → rất cao
+* engineering blog → cao
+* báo tech uy tín → trung cao
+* blog lạ → thấp
+* SEO farm → block
+
+5. ARTICLE QUALITY SCORING
+
+Tính score dựa trên:
+
+* domain_trust_score
+* recency
+* keyword_boost
+* originality
+* depth
+* trend_score
+
+- clickbait_penalty
+- duplicate_penalty
+
+Keyword boost:
+
+* release, launch, model, AI, inference, benchmark, open source, reasoning, agent, NVIDIA, OpenAI
+
+Penalty:
+
+* review, hands-on, rumor, leak, deal, buy, top 10
+
+6. DEDUPLICATION (RẤT QUAN TRỌNG)
+
+3 lớp:
+
+A. exact duplicate
+
+* same URL
+* same canonical
+
+B. fuzzy title
+
+* similarity >= 0.88
+
+C. event-level
+
+* cùng sự kiện nhưng khác title
+* chỉ giữ bài tốt nhất
+* ưu tiên source gốc
+
+7. SOURCE PRIORITY LOGIC
+
+Nếu cùng sự kiện:
+
+* giữ OpenAI blog > TechCrunch
+* giữ GitHub blog > báo viết lại
+* giữ engineering blog > báo tổng hợp
+
+8. BUCKET SELECTION (KHÔNG DÙNG TOP N NGU NGỐC)
+
+Chia slot:
+
+* big_news: 3
+* ai: 4
+* dev: 3
+* tech: 3
+* trend: 2
+
+Tổng ~15 bài/ngày
+
+9. DYNAMIC SOURCE EVALUATION
+
+Nếu domain mới:
+
+* đưa vào candidate_sources
+* theo dõi chất lượng 5–10 bài
+* nếu tốt → promote thành trusted
+* nếu kém → block
+
+10. SUMMARIZATION + TRANSLATION
+
+KHÔNG copy RSS.
+
+Phải:
+
+* viết lại tiếng Việt
+* ngắn gọn
+* rõ ý
+* không dịch máy cứng
+
+Format:
+
+🔥 Tiêu đề (rewrite hấp dẫn)
+
+* Ý chính 1
+* Ý chính 2
+* Ý chính 3
+
+👉 Vì sao đáng chú ý
+
+🔗 link
+
+11. TELEGRAM POSTING
+
+* escape markdown đúng
+* không crash nếu lỗi format
+* batch posting
+* rate limit
+* không spam
+
+12. SCHEDULER
+
+* không post dồn
+* chia khung giờ
+* lock job tránh chạy trùng
+
+13. CACHE + STATE
+
+* lưu bài đã đăng
+* tránh post lại
+* TTL rõ ràng
+
+14. LOGGING
+
+Log:
+
+* số bài fetch
+* số bài bị loại
+* số duplicate
+* score từng bài
+* lý do chọn bài
+* lỗi hệ thống
+
+========================================
+🧪 TESTING (BẮT BUỘC)
+=====================
+
+Test:
+
+* RSS parsing
+* duplicate detection
+* scoring logic
+* bucket selection
+* telegram format
+* URL canonicalization
+* timezone parsing
+
+========================================
+⚙️ ADMIN COMMANDS
+=================
+
+* /health
+* /stats
+* /sources
+* /last
+* /top_today
+* /dryrun
+* /force_fetch
+
+========================================
+📊 OUTPUT YÊU CẦU
+=================
+
+Sau khi hoàn tất:
+
+1. liệt kê file đã sửa
+2. liệt kê tất cả lỗi đã phát hiện
+3. giải thích các cải tiến
+4. cách chạy
+5. cách test
+6. đề xuất cải tiến thêm
+
+========================================
+🚨 RÀNG BUỘC
+============
+
+* Không dừng khi tìm thấy 1 bug
+* Phải quét toàn bộ code
+* Không assume bug đầu tiên là đúng
+* Ưu tiên stability hơn speed
+* Code phải sạch, dễ maintain
+* Không phá hệ thống hiện tại nếu không cần
+
+========================================
+🎯 MỤC TIÊU CUỐI
+================
+
+Bot phải trở thành:
+
+* curated Vietnamese tech/AI/dev news channel
+* tự động
+* thông minh
+* ít spam
+* ít trùng
+* luôn chọn bài đáng đọc nhất
+* tự mở rộng nguồn theo thời gian
+
+Bắt đầu bằng:
+
+* phân tích codebase
+* vẽ pipeline hiện tại
+* chỉ ra lỗi
+* sau đó refactor toàn bộ hệ thống
