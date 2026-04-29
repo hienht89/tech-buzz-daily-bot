@@ -18,6 +18,14 @@
  *     (b) phạt nặng (BLOCKED_DOMAINS) các domain SEO farm / clickbait / paywall
  *         spam — đảm bảo không bao giờ được pick dù score keyword cao.
  *   Cấu trúc table → dễ mở rộng khi gặp domain rác mới.
+ *
+ * Phase 17 — Anti-fluff / news verb / path penalty:
+ *   QA editorial review phát hiện top channel toàn anniversary, tutorial sơ
+ *   cấp, arxiv niche. Ba tầng signal mới:
+ *     - newsVerbBoost (filter.ts) → ưu tiên tin có sự kiện thực.
+ *     - fluffPenalty (filter.ts)  → kéo anniversary/tutorial xuống dưới slot.
+ *     - pathPenalty (score.ts)    → vercel.com/changelog/... và .../release-notes/...
+ *       không phải news, dù domain trust cao.
  */
 
 import type { Article } from "./rss.js";
@@ -158,6 +166,21 @@ const BLOCKED_DOMAINS: ReadonlySet<string> = new Set([
 ]);
 const BLOCKED_DOMAIN_PENALTY = 1000;
 
+/**
+ * Path-prefix penalty — bài thuộc các path không phải news (changelog,
+ * release-notes). Áp cho domain trust cao như vercel.com mà path là changelog
+ * (đầy mỗi bug fix nhỏ, không phải news đáng top channel).
+ *
+ * Rule:
+ *   - vercel.com/changelog/*           → penalty
+ *   - <any>/release-notes/* (segment)  → penalty
+ *
+ * Penalty đủ lớn để bù với domain trust + recency, nhưng không hard-block —
+ * nếu thực sự là changelog blockbuster (vd "AI SDK 5.0 launched"), news verb
+ * boost vẫn có thể kéo lên lại.
+ */
+const PATH_PENALTY = 30;
+
 // ────────────────────────────────────────────────────────────────────────────
 
 export type ScoreBreakdown = {
@@ -165,6 +188,10 @@ export type ScoreBreakdown = {
   recency: number;
   keywordBoost: number;
   keywordPenalty: number;
+  /** Phase 17: tín hiệu "có sự kiện" — launches/raises/acquires/open source… */
+  newsVerbBoost: number;
+  /** Phase 17: anniversary / tutorial sơ cấp / "for beginners" / "what is"… */
+  fluffPenalty: number;
   primaryLab: number;
   engineering: number;
   depth: number;
@@ -173,6 +200,8 @@ export type ScoreBreakdown = {
   domainTrust: number;
   /** Per-domain block penalty (Phase 11). >0 nếu domain bị block, ngược lại 0. */
   domainBlock: number;
+  /** Phase 17: penalty cho path không phải news (changelog, release-notes). */
+  pathPenalty: number;
   total: number;
 };
 
@@ -211,6 +240,35 @@ function isDomainBlocked(domain: string): boolean {
 }
 
 /**
+ * Tính path penalty: vercel.com/changelog/... và bất kỳ .../release-notes/...
+ * (match theo path segment, không substring, để tránh false positive như
+ * "/announce-release-notes-feature").
+ */
+function lookupPathPenalty(url: string): number {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return 0;
+  }
+  const host = parsed.hostname.toLowerCase();
+  const segments = parsed.pathname.toLowerCase().split("/").filter(Boolean);
+
+  // vercel.com/changelog/* (suffix match cho subdomain)
+  const isVercel = host === "vercel.com" || host.endsWith(".vercel.com");
+  if (isVercel && segments[0] === "changelog") {
+    return PATH_PENALTY;
+  }
+
+  // any */release-notes/* — match theo segment
+  if (segments.includes("release-notes")) {
+    return PATH_PENALTY;
+  }
+
+  return 0;
+}
+
+/**
  * Tính score cho 1 article. Pure function — không side effect.
  *
  * @param now thời điểm tham chiếu để tính recency. Inject vào để test.
@@ -239,40 +297,51 @@ export function scoreArticle(article: Article, now: Date = new Date()): ScoreBre
   const hnPenalty = article.source === "Hacker News" ? HN_PENALTY : 0;
 
   // Phase 11: per-domain trust + block
-  const domain = extractDomain(article.canonicalUrl || article.link);
+  const url = article.canonicalUrl || article.link;
+  const domain = extractDomain(url);
   const domainTrust = lookupDomainTrust(domain);
   const domainBlock = isDomainBlocked(domain) ? BLOCKED_DOMAIN_PENALTY : 0;
 
+  // Phase 17: path penalty
+  const pathPenalty = lookupPathPenalty(url);
+
   const total =
-    source + recency + kw.boost - kw.penalty + primaryLab + engineering + depth - hnPenalty +
-    domainTrust - domainBlock;
+    source + recency + kw.boost - kw.penalty +
+    kw.newsVerbBoost - kw.fluffPenalty +
+    primaryLab + engineering + depth - hnPenalty +
+    domainTrust - domainBlock - pathPenalty;
 
   return {
     source,
     recency,
     keywordBoost: kw.boost,
     keywordPenalty: kw.penalty,
+    newsVerbBoost: kw.newsVerbBoost,
+    fluffPenalty: kw.fluffPenalty,
     primaryLab,
     engineering,
     depth,
     hnPenalty,
     domainTrust,
     domainBlock,
+    pathPenalty,
     total,
   };
 }
 
 /**
  * Format breakdown thành string ngắn để log.
- * Vd: "src=70 rec=85 kw=+20-15 lab=+30 eng=0 dep=+10 hn=0 dom=+15-0 → 215"
+ * Vd: "src=70 rec=85 kw=+20-15 nv=+20 fl=-15 lab=+30 eng=0 dep=+10 hn=0
+ *      dom=+15-0 path=-30 → 215"
  */
 export function formatBreakdown(b: ScoreBreakdown): string {
   return (
     `src=${b.source} rec=${b.recency} ` +
     `kw=+${b.keywordBoost}-${b.keywordPenalty} ` +
+    `nv=+${b.newsVerbBoost} fl=-${b.fluffPenalty} ` +
     `lab=+${b.primaryLab} eng=+${b.engineering} ` +
     `dep=+${b.depth} hn=-${b.hnPenalty} ` +
-    `dom=+${b.domainTrust}-${b.domainBlock} → ${b.total}`
+    `dom=+${b.domainTrust}-${b.domainBlock} path=-${b.pathPenalty} → ${b.total}`
   );
 }
 
@@ -293,7 +362,9 @@ export const __test = {
   DOMAIN_TRUST_TABLE,
   BLOCKED_DOMAINS,
   BLOCKED_DOMAIN_PENALTY,
+  PATH_PENALTY,
   extractDomain,
   lookupDomainTrust,
   isDomainBlocked,
+  lookupPathPenalty,
 };

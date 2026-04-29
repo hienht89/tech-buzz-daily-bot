@@ -251,13 +251,95 @@ test("filter.keywordScore: cap không vượt quá BOOST_CAP/PENALTY_CAP", () =>
 });
 
 test("filter.isRelevantArxivPaper: paper LLM → pass", () => {
+  // Phase 17: cần ≥2 distinct non-overlap keyword
+  // "LLM reasoning chain-of-thought" → llm + reasoning = 2 distinct ✓
   assert.equal(isRelevantArxivPaper("Improving LLM reasoning with chain-of-thought"), true);
+  // "Diffusion models for video generation" → diffusion + video generation = 2 ✓
   assert.equal(isRelevantArxivPaper("Diffusion models for video generation"), true);
 });
 
 test("filter.isRelevantArxivPaper: paper toán thuần → reject", () => {
   assert.equal(isRelevantArxivPaper("Stochastic Gradient on Riemannian Manifolds"), false);
   assert.equal(isRelevantArxivPaper("Bayesian inference with Monte Carlo"), false);
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// Phase 17: news verb boost, fluff penalty, arxiv ≥2 keyword strict
+// ────────────────────────────────────────────────────────────────────────────
+
+test("filter.keywordScore: news verb 'launches' cộng newsVerbBoost > 0", () => {
+  const r = keywordScore("Acme launches new platform", "");
+  assert.ok(r.newsVerbBoost > 0, `expected newsVerbBoost > 0, got ${r.newsVerbBoost}`);
+  // Generic boost không nên nhận từ "launches" nữa (đã chuyển sang NEWS_VERB)
+});
+
+test("filter.keywordScore: 'open source' / 'raises' / 'acquires' đều là news verb", () => {
+  const a = keywordScore("Vercel open sources its v0 model", "");
+  const b = keywordScore("Anthropic raises $5B in Series F", "");
+  const c = keywordScore("Stripe acquires Bridge for stablecoin payments", "");
+  assert.ok(a.newsVerbBoost > 0);
+  assert.ok(b.newsVerbBoost > 0);
+  assert.ok(c.newsVerbBoost > 0);
+});
+
+test("filter.keywordScore: news verb cap không vượt NEWS_VERB_CAP", () => {
+  // Spam nhiều verb để vượt cap
+  const r = keywordScore(
+    "launches launched released releases announces announced raises raised acquires open source",
+    "generally available general availability",
+  );
+  assert.ok(r.newsVerbBoost <= 40, `news verb boost ${r.newsVerbBoost} phải ≤ cap 40`);
+});
+
+test("filter.keywordScore: fluff 'celebrating' + 'anniversary' bị penalty", () => {
+  const r = keywordScore("Celebrating 20 years of Google Translate", "Anniversary post");
+  assert.ok(r.fluffPenalty > 0, `expected fluffPenalty > 0, got ${r.fluffPenalty}`);
+});
+
+test("filter.keywordScore: fluff 'X years' regex match", () => {
+  const r = keywordScore("Looking back at 10 years of Kubernetes", "");
+  assert.ok(r.fluffPenalty > 0, "regex \\d+ years phải match");
+});
+
+test("filter.keywordScore: fluff 'for beginners' / 'getting started' / 'what is' bị penalty", () => {
+  assert.ok(keywordScore("GitHub for Beginners: Markdown", "").fluffPenalty > 0);
+  assert.ok(keywordScore("Getting started with Rust", "").fluffPenalty > 0);
+  assert.ok(keywordScore("What is RAG?", "").fluffPenalty > 0);
+});
+
+test("filter.keywordScore: bài news không bị fluff penalty", () => {
+  const r = keywordScore("OpenAI launches GPT-5 with improved reasoning", "");
+  assert.equal(r.fluffPenalty, 0);
+  assert.ok(r.newsVerbBoost > 0);
+});
+
+test("filter.isRelevantArxivPaper: chỉ 1 keyword → reject (Phase 17)", () => {
+  // SoccerRef-Agents: chỉ match "agent" → reject
+  assert.equal(
+    isRelevantArxivPaper("SoccerRef-Agents: Multi-Agent Soccer Refereeing"),
+    false,
+    "chỉ match 'agent' → phải reject",
+  );
+});
+
+test("filter.isRelevantArxivPaper: ≥2 distinct keyword → pass", () => {
+  // "LLM agent" → llm + agent = 2 distinct ✓
+  assert.equal(isRelevantArxivPaper("Building LLM agents for code generation"), true);
+});
+
+test("filter.isRelevantArxivPaper: nested keyword không double-count", () => {
+  // "Large language model" chứa "language model" — chỉ tính 1 hit, không phải 2
+  // → cần keyword khác mới đủ 2
+  assert.equal(
+    isRelevantArxivPaper("Large language model alignment"),
+    true, // alignment + language model = 2 distinct ✓
+  );
+  // Chỉ có "Language model" alone không đủ
+  assert.equal(
+    isRelevantArxivPaper("Language model architectures"),
+    false,
+    "chỉ 1 distinct keyword 'language model' → reject",
+  );
 });
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -384,6 +466,150 @@ test("score: domain không nằm trong table → trust = 0, không crash", () =>
   );
   assert.equal(r.domainTrust, 0);
   assert.equal(r.domainBlock, 0);
+});
+
+// Phase 17: news verb boost / fluff penalty / path penalty integration
+test("score: news verb boost cộng vào total", () => {
+  const now = new Date();
+  const fixed = new Date(now.getTime() - 3600 * 1000);
+  const news = scoreArticle(
+    mkArticle({
+      title: "Anthropic launches Claude 4 with multimodal reasoning",
+      pubDate: fixed,
+    }),
+    now,
+  );
+  const baseline = scoreArticle(
+    mkArticle({
+      title: "Some unrelated topic about water cooler chats",
+      pubDate: fixed,
+    }),
+    now,
+  );
+  assert.ok(news.newsVerbBoost > 0);
+  assert.ok(news.total > baseline.total, "news verb article phải tổng cao hơn");
+});
+
+test("score: fluff penalty kéo total xuống", () => {
+  const now = new Date();
+  const fixed = new Date(now.getTime() - 3600 * 1000);
+  const fluff = scoreArticle(
+    mkArticle({
+      title: "Celebrating 20 years of Google Translate",
+      source: "Google AI Blog",
+      sourcePriority: 1,
+      pubDate: fixed,
+    }),
+    now,
+  );
+  const news = scoreArticle(
+    mkArticle({
+      title: "Google launches new Gemini model with vision",
+      source: "Google AI Blog",
+      sourcePriority: 1,
+      pubDate: fixed,
+    }),
+    now,
+  );
+  assert.ok(fluff.fluffPenalty > 0, "fluff phải bị penalty");
+  assert.ok(
+    news.total > fluff.total,
+    `news total ${news.total} phải > fluff total ${fluff.total}`,
+  );
+});
+
+test("score: vercel.com/changelog/* bị path penalty", () => {
+  const now = new Date();
+  const fixed = new Date(now.getTime() - 3600 * 1000);
+  const r = scoreArticle(
+    mkArticle({
+      link: "https://vercel.com/changelog/ai-sdk-5-0-released",
+      canonicalUrl: "https://vercel.com/changelog/ai-sdk-5-0-released",
+      source: "Vercel Blog",
+      sourcePriority: 2,
+      pubDate: fixed,
+    }),
+    now,
+  );
+  assert.ok(r.pathPenalty > 0, `vercel changelog phải pathPenalty > 0, got ${r.pathPenalty}`);
+});
+
+test("score: vercel.com gốc (không phải /changelog) → no path penalty", () => {
+  const now = new Date();
+  const fixed = new Date(now.getTime() - 3600 * 1000);
+  const r = scoreArticle(
+    mkArticle({
+      link: "https://vercel.com/blog/some-post",
+      canonicalUrl: "https://vercel.com/blog/some-post",
+      source: "Vercel Blog",
+      sourcePriority: 2,
+      pubDate: fixed,
+    }),
+    now,
+  );
+  assert.equal(r.pathPenalty, 0);
+});
+
+test("score: bất kỳ */release-notes/* bị path penalty", () => {
+  const now = new Date();
+  const fixed = new Date(now.getTime() - 3600 * 1000);
+  const r = scoreArticle(
+    mkArticle({
+      link: "https://github.com/foo/release-notes/v2.0",
+      canonicalUrl: "https://github.com/foo/release-notes/v2.0",
+      pubDate: fixed,
+    }),
+    now,
+  );
+  assert.ok(r.pathPenalty > 0);
+});
+
+test("score: path 'release-notes' chỉ match khi là segment, không phải substring", () => {
+  const now = new Date();
+  const fixed = new Date(now.getTime() - 3600 * 1000);
+  // Path "/announce-release-notes-feature" KHÔNG nên match
+  const r = scoreArticle(
+    mkArticle({
+      link: "https://example.com/announce-release-notes-feature",
+      canonicalUrl: "https://example.com/announce-release-notes-feature",
+      pubDate: fixed,
+    }),
+    now,
+  );
+  assert.equal(r.pathPenalty, 0, "substring 'release-notes' trong segment tên khác KHÔNG match");
+});
+
+// Phase 17: QA editorial scenarios — verify 3 bài bị flag không còn lọt top
+test("score QA: 'GitHub for Beginners: Markdown' bị fluff penalty kéo xuống", () => {
+  const now = new Date();
+  const fixed = new Date(now.getTime() - 3600 * 1000);
+  const tutorial = scoreArticle(
+    mkArticle({
+      title: "GitHub for Beginners: Markdown",
+      link: "https://github.blog/2026/04/29/github-for-beginners-markdown",
+      canonicalUrl: "https://github.blog/2026/04/29/github-for-beginners-markdown",
+      source: "GitHub Blog",
+      sourcePriority: 2,
+      pubDate: fixed,
+    }),
+    now,
+  );
+  const realNews = scoreArticle(
+    mkArticle({
+      title: "GitHub launches new Copilot extension",
+      link: "https://github.blog/2026/04/29/copilot-launch",
+      canonicalUrl: "https://github.blog/2026/04/29/copilot-launch",
+      source: "GitHub Blog",
+      sourcePriority: 2,
+      pubDate: fixed,
+    }),
+    now,
+  );
+  assert.ok(tutorial.fluffPenalty > 0);
+  assert.ok(
+    realNews.total > tutorial.total,
+    `real news (${realNews.total}) phải xếp trên tutorial (${tutorial.total})`,
+  );
 });
 
 test("score: URL không parse được → domain rỗng, không crash", () => {
