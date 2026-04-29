@@ -46,6 +46,8 @@ Deployed to Cloudflare Workers. Migrated từ GitHub Actions vì GH Actions cron
   - `quota:YYYY-MM-DD:<category>` — đếm bài đã post mỗi bucket trong ngày
   - `last_posted_v1` — metadata bài cuối + run history (10 entry gần nhất)
   - `failed:<sha1(canonical_url)>` — fail counter, sau 3 lần fail liên tục → poison 24h
+  - `skipped:YYYY-MM-DD` — Task 6: counter slot/ngày bị skip do `all candidates below MIN_SCORE_THRESHOLD`. TTL 36h, auto-reset mỗi ngày. Cảnh báo Telegram cho admin khi ≥ 3 (xem `TELEGRAM_ADMIN_CHAT_ID`).
+  - `skipped_alert_sent:YYYY-MM-DD` — Task 6: flag "đã gửi cảnh báo skipped-slot trong ngày X". TTL 36h. Bot chỉ set flag SAU khi gửi Telegram thành công → nếu Telegram down đúng tick count đạt 3, tick sau (count=4) sẽ retry, không miss alert. Khi flag tồn tại → silent (không spam admin).
 - **RSS sources**: **21 nguồn** curated (xem `worker/src/sources.ts`) — chia 5 category (`core`, `ai`, `dev`, `research`, `trend`) với priority 1-3. Phase 10: bỏ Anthropic News + Meta AI Blog (dead 404) + Papers with Code (parser fail), thêm Stripe / Cloudflare / Vercel / AWS / Simon Willison / Latent Space.
 - **Endpoints debug** (`Authorization: Bearer <RUN_TRIGGER_TOKEN>`):
   - `GET /health`, `GET /sources`, `GET /stats`, `GET /last`
@@ -68,6 +70,14 @@ Deployed to Cloudflare Workers. Migrated từ GitHub Actions vì GH Actions cron
   - **`runBot` ghi `lastAiError` vào `RunResult.reason`**: dry-run / `/run` giờ lộ message thực của provider cuối (không cần `wrangler tail`).
   - **`/top_today` thêm `topPreGate`**: top 10 bài có score cao nhất TRƯỚC khi qua MIN_SCORE_THRESHOLD + KV check → nhìn được score thực tế của batch hiện tại.
   - **Endpoint MỚI `/diag_ai`** (cần Bearer): probe từng AI provider trên 1 article giả, KHÔNG chạm KV/Telegram/RSS. Trả `{provider, ok, ms, error}` cho từng cái — chẩn đoán "provider nào sống/chết" trong 1 request.
+- **Phase 18 (Apr 29, 2026) — Task 6: cảnh báo Telegram khi skip slot do thiếu bài**:
+  - **Counter mới `skipped:YYYY-MM-DD`** (`worker/src/skipCounter.ts`): mỗi tick mà bot bỏ trống slot vì lý do `all candidates below MIN_SCORE_THRESHOLD` → tăng counter. Key TTL 36h, auto-reset mỗi ngày. Chỉ tăng khi `dryRun=false` để admin curl `/run?dry=1` thoải mái không làm sai counter.
+  - **Cảnh báo Telegram tối đa 1 lần/ngày, có retry**: khi `count ≥ SKIP_ALERT_THRESHOLD = 3` VÀ flag `skipped_alert_sent:YYYY-MM-DD` chưa set → thử gửi. Set flag CHỈ KHI gửi thành công. Nếu Telegram down đúng tick count=3 → tick sau (count=4) sẽ retry, không miss alert. Khi flag đã set → silent hết ngày (không spam mỗi 2h). Gửi qua `sendAdminAlert()` mới ở `worker/src/telegram.ts` → endpoint `sendMessage` tới `TELEGRAM_ADMIN_CHAT_ID`.
+  - **Env mới `TELEGRAM_ADMIN_CHAT_ID`** (optional): không set → tắt cảnh báo (counter vẫn chạy nền, có thể đọc qua `/stats.skippedSlotCount`). Set qua `wrangler secret put TELEGRAM_ADMIN_CHAT_ID`.
+  - **`/stats` endpoint** trả thêm `skippedSlotCount` + `skippedSlotAlertThreshold` để admin debug được trực tiếp.
+  - **Tách module `skipCounter.ts` (không nằm trong `storage.ts`)** vì storage.ts có runtime imports `./url.js`/`./dedup.js` không tương thích với `node --experimental-strip-types --test` (Node không tự rewrite `.js` → `.ts`). Module mới chỉ phụ thuộc KV (subset interface `SkipCounterKv`) → unit-test được trực tiếp với Map trong test.
+  - **Test:** 115/115 unit pass (thêm 5 test mới: counter increment/độc lập theo ngày/corrupt-value/empty + flag flow với TTL & day-isolation). Lỗi gửi Telegram trong `sendAdminAlert` được catch tại chỗ → KHÔNG bao giờ throw lên pipeline chính (slot quan trọng hơn alert).
+  - **Lý do KHÔNG sửa storage.ts:** giữ scope nhỏ, không churn module post-lifecycle. Counter là feature monitoring/alert độc lập → nằm riêng dễ đọc.
 - **Phase 17 (Apr 29, 2026) — KV observability + write resilience (P0-A/B/C/P1)**:
   - **P0-A (AI quota):** xác nhận `worker/src/ai.ts` Phase 9.2 đã hỗ trợ `GOOGLE_API_KEY` + `GOOGLE_API_KEY_1.._5` rotation. Không sửa code. Hướng dẫn user trong Phase 15 vẫn áp dụng: thêm key qua `wrangler secret put GOOGLE_API_KEY_1` (mỗi key = 1 tài khoản Google = 1 quota free riêng).
   - **P0-B (KV namespace):** xác minh binding production. `wrangler.toml` bind `POSTED_KV` → id `70ab341227fd4badb90dfa2d761dde32`; mọi read/write trong code đều qua `env.POSTED_KV`. Deploy log + `/debug_kv` đều confirm cùng namespace, không có mismatch. Bot chỉ dùng MỘT binding duy nhất → an toàn theo thiết kế.
@@ -105,6 +115,7 @@ Deployed to Cloudflare Workers. Migrated từ GitHub Actions vì GH Actions cron
 | `GOOGLE_API_KEY_1` … `_5` | **Optional, recommended** — Gemini API key từ tài khoản Google KHÁC (mỗi key 1 quota free riêng). Bot tự xoay vòng (Phase 9.2). Khuyến nghị set ít nhất `_1` để giảm rủi ro cạn quota free tier. |
 | `OPENROUTER_API_KEY` | **Optional** — API key từ openrouter.ai/keys (provider 3+4: Llama/Gemma free). Không set → bot vẫn chạy chỉ với Gemini như cũ. |
 | `RUN_TRIGGER_TOKEN` | Token RIÊNG để bảo vệ endpoint `/run` (KHÔNG dùng chung Telegram token) |
+| `TELEGRAM_ADMIN_CHAT_ID` | **Optional** — Chat ID nhận cảnh báo Telegram khi bot bỏ trống ≥ 3 slot/ngày do `all candidates below MIN_SCORE_THRESHOLD` (Task 6). Có thể là DM admin (vd `123456789`) hoặc channel test riêng (vd `@my_admin_alerts`). Không set → tắt cảnh báo (counter vẫn ghi vào KV, đọc qua `/stats.skippedSlotCount`). |
 
 #### Required vars (in `wrangler.toml`)
 

@@ -348,6 +348,44 @@ async function sendTextMessage(
   });
 }
 
+/**
+ * Gửi cảnh báo riêng cho admin (KHÔNG đăng vào channel chính).
+ *
+ * - Đích đến: `env.TELEGRAM_ADMIN_CHAT_ID` (DM admin hoặc 1 channel test riêng).
+ * - Nếu env var không set → no-op (return false). Bot chạy bình thường, KHÔNG
+ *   raise lỗi — alert là tính năng optional.
+ * - parse_mode `HTML`, link preview tắt (giống postArticle, tránh embed lung tung).
+ * - disable_notification = false → admin nhận push notification (đây LÀ alert,
+ *   cần thấy ngay, không silent).
+ * - Lỗi gửi (network / 401 / 403) được CATCH ngay tại đây và log; KHÔNG throw
+ *   ra ngoài để pipeline chính vẫn tiếp tục — slot quan trọng hơn alert.
+ *
+ * Trả về `true` nếu đã gửi thành công, `false` nếu skip (không cấu hình) hoặc
+ * gặp lỗi (đã log).
+ */
+export async function sendAdminAlert(
+  env: Env & { TELEGRAM_ADMIN_CHAT_ID?: string },
+  text: string,
+): Promise<boolean> {
+  const adminId = env.TELEGRAM_ADMIN_CHAT_ID?.trim();
+  if (!adminId) return false;
+  try {
+    await callApiWithRetry(env, "sendMessage", {
+      chat_id: adminId,
+      text,
+      parse_mode: "HTML",
+      link_preview_options: { is_disabled: true },
+    });
+    return true;
+  } catch (err) {
+    console.error(
+      `[telegram] sendAdminAlert failed (admin=${adminId.slice(0, 12)}…): ` +
+        `${(err as Error).message?.slice(0, 200)}`,
+    );
+    return false;
+  }
+}
+
 export async function postArticle(
   article: Article,
   summary: Summary,

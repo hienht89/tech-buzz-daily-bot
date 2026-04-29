@@ -13,7 +13,7 @@ import {
   summarizeKvResults,
   type KvOpResult,
 } from "./diag.js";
-import { postArticle } from "./telegram.js";
+import { postArticle, sendAdminAlert } from "./telegram.js";
 import { extractOgImage } from "./og.js";
 import { isRelevantArxivPaper } from "./filter.js";
 import { scoreArticle, formatBreakdown } from "./score.js";
@@ -41,6 +41,12 @@ import {
   getLastPosted,
   MAX_FAIL_BEFORE_SKIP,
 } from "./storage.js";
+import {
+  incrementSkippedSlotCount,
+  getSkippedSlotCount,
+  wasAdminAlertSent,
+  markAdminAlertSent,
+} from "./skipCounter.js";
 
 export interface Env {
   POSTED_KV: KVNamespace;
@@ -71,6 +77,17 @@ export interface Env {
    * Nếu không set, endpoint /run sẽ bị tắt hoàn toàn.
    */
   RUN_TRIGGER_TOKEN?: string;
+  /**
+   * Chat ID nhận cảnh báo Telegram khi bot bỏ qua ≥ SKIP_ALERT_THRESHOLD slot
+   * trong ngày do "all candidates below MIN_SCORE_THRESHOLD".
+   *
+   * Có thể là DM admin (số dương, vd `123456789`) hoặc 1 channel test riêng
+   * (vd `@my_admin_alerts` / `-100123…`).
+   *
+   * KHÔNG set → tắt cảnh báo (counter vẫn chạy nền, có thể đọc qua /stats).
+   * Đặt qua `wrangler secret put TELEGRAM_ADMIN_CHAT_ID`.
+   */
+  TELEGRAM_ADMIN_CHAT_ID?: string;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -107,6 +124,19 @@ const MAX_CANDIDATES_PER_RUN = 5;
  * Có thể chỉnh xuống nếu thấy bot skip quá nhiều slot (xem `/stats` + log).
  */
 const MIN_SCORE_THRESHOLD = 220;
+
+/**
+ * Số slot/ngày bị skip do "all candidates below MIN_SCORE_THRESHOLD" trước
+ * khi gửi cảnh báo Telegram cho admin (Task 6, Apr 2026).
+ *
+ * Triết lý: 1 slot skip lẻ tẻ là bình thường (RSS feed có lúc kém), nhưng
+ * ≥ 3 slot/ngày = RSS đang yếu / threshold đặt quá cao → admin cần biết để
+ * điều chỉnh sớm. Cron 9 tick/ngày → 3 slot ≈ 1/3 ngày bỏ trống.
+ *
+ * Cảnh báo CHỈ gửi 1 lần/ngày (đúng lúc counter vừa CROSS từ 2 → 3) để tránh
+ * spam DM admin mỗi tick. Counter reset mỗi ngày qua KV TTL.
+ */
+const SKIP_ALERT_THRESHOLD = 3;
 
 // ────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -339,6 +369,104 @@ function nextCandidateToTry(
 }
 
 /**
+ * Tăng counter slot bị skip do "all candidates below MIN_SCORE_THRESHOLD" cho
+ * ngày hôm nay. Gửi Telegram alert tối đa 1 lần / ngày (set flag KV
+ * `skipped_alert_sent:YYYY-MM-DD` SAU khi gửi thành công).
+ *
+ * Khác với "fire khi count === threshold": dùng `count >= threshold AND
+ * !alreadySent`. Nếu Telegram transient down ĐÚNG tick count đạt 3, tick sau
+ * (count=4) sẽ thử lại — không miss alert vĩnh viễn.
+ *
+ * Tách thành function riêng vì:
+ *  - Có 2 path lỗi cần handle khác nhau (KV write fail vs Telegram fail) và
+ *    cả hai phải được catch để KHÔNG ảnh hưởng pipeline chính (slot quan trọng
+ *    hơn alert).
+ *  - Dễ kiểm tra logic bằng mắt mà không phải đọc cả `runBotInternal` dài hàng
+ *    trăm dòng.
+ *
+ * Trả về newCount (số slot skip sau khi tăng) để caller log; trả 0 nếu KV
+ * write fail (counter chưa tăng, alert sẽ thử lại tick sau).
+ */
+async function maybeAlertSkippedSlot(
+  env: Env,
+  runId: string,
+  skippedLowScore: number,
+): Promise<number> {
+  const dayKey = todayKeyUTC();
+  let newCount: number;
+  try {
+    newCount = await incrementSkippedSlotCount(env.POSTED_KV, dayKey);
+  } catch (err) {
+    console.error(
+      `[bot:${runId}] Skip-counter KV write fail: ` +
+        `${(err as Error).message?.slice(0, 200)}. Alert delayed.`,
+    );
+    return 0;
+  }
+  console.log(
+    `[bot:${runId}] Skipped slot counter today (${dayKey}): ` +
+      `${newCount} (alert threshold = ${SKIP_ALERT_THRESHOLD})`,
+  );
+
+  if (newCount < SKIP_ALERT_THRESHOLD) {
+    return newCount;
+  }
+  if (!env.TELEGRAM_ADMIN_CHAT_ID) {
+    console.log(
+      `[bot:${runId}] Counter ≥ threshold nhưng TELEGRAM_ADMIN_CHAT_ID ` +
+        `không set → bỏ qua alert.`,
+    );
+    return newCount;
+  }
+
+  // Check flag: nếu hôm nay đã alert thành công 1 lần rồi → silent (tick 4,5,..
+  // không spam). KV read fail → giả định CHƯA gửi để safe-side (admin có thể
+  // bị duplicate alert thay vì miss).
+  let alreadySent = false;
+  try {
+    alreadySent = await wasAdminAlertSent(env.POSTED_KV, dayKey);
+  } catch (err) {
+    console.error(
+      `[bot:${runId}] Read alert-sent flag fail (assume not sent): ` +
+        `${(err as Error).message?.slice(0, 200)}`,
+    );
+  }
+  if (alreadySent) {
+    return newCount;
+  }
+
+  const text =
+    `⚠️ <b>Tech Buzz Daily — cảnh báo chất lượng</b>\n\n` +
+    `Hôm nay (${dayKey}, UTC) bot đã <b>bỏ qua ${newCount} slot</b> vì không có bài nào ` +
+    `score ≥ <b>${MIN_SCORE_THRESHOLD}</b>.\n\n` +
+    `Tick gần nhất có ${skippedLowScore} bài bị skip do score thấp.\n\n` +
+    `Có thể do nguồn RSS hôm nay yếu hoặc <code>MIN_SCORE_THRESHOLD</code> đặt quá cao. ` +
+    `Kiểm tra <code>/top_today</code> xem điểm thực tế và cân nhắc chỉnh ngưỡng.`;
+  const sent = await sendAdminAlert(env, text);
+  if (sent) {
+    console.log(
+      `[bot:${runId}] ✅ Đã gửi cảnh báo skipped-slot tới admin (count=${newCount}).`,
+    );
+    // Set flag chỉ KHI gửi thành công. Nếu set fail → tick sau có thể gửi lại
+    // (admin nhận duplicate) — chấp nhận được vì hiếm + không miss thông tin.
+    try {
+      await markAdminAlertSent(env.POSTED_KV, dayKey);
+    } catch (err) {
+      console.error(
+        `[bot:${runId}] Set alert-sent flag fail (next tick may resend): ` +
+          `${(err as Error).message?.slice(0, 200)}`,
+      );
+    }
+  } else {
+    console.log(
+      `[bot:${runId}] ⚠️ Gửi cảnh báo skipped-slot FAIL (count=${newCount}). ` +
+        `Sẽ thử lại tick sau.`,
+    );
+  }
+  return newCount;
+}
+
+/**
  * Internal run. Không throw ra ngoài — mọi lỗi candidate đều được catch để
  * tiếp tục thử bài tiếp theo. Cron handler không bao giờ thấy exception.
  */
@@ -353,17 +481,31 @@ async function runBotInternal(
   const pick = await pickCandidates(env, runId);
 
   if (pick.candidates.length === 0) {
+    const isLowScoreSkip =
+      pick.skippedLowScore > 0 && pick.clusteredCount > 0;
     const reason = pick.totalFetched === 0
       ? "all RSS sources failed"
       : pick.freshCount === 0
         ? "no fresh articles (>48h)"
         : pick.techCount === 0
           ? "no tech-relevant articles after filter"
-          : pick.skippedLowScore > 0 && pick.clusteredCount > 0
+          : isLowScoreSkip
             ? `all candidates below MIN_SCORE_THRESHOLD=${MIN_SCORE_THRESHOLD} ` +
               `(${pick.skippedLowScore} bài bị skip vì score thấp) — slot bỏ trống ưu tiên chất lượng`
             : "all candidates đã đăng / poison / dup";
     console.warn(`[bot:${runId}] No candidate to try. Reason: ${reason}`);
+
+    // ───── Task 6: cảnh báo Telegram khi quá nhiều slot bị skip do thiếu bài ─────
+    // CHỈ tăng counter cho lý do "all candidates below MIN_SCORE_THRESHOLD".
+    // Các reason khác (RSS chết, AI quota cạn, v.v.) là sự cố kỹ thuật riêng,
+    // sẽ có alert riêng (xem các task khác trong backlog).
+    //
+    // Bỏ qua khi `dryRun` để admin curl `/run?dry=1` test thoải mái mà không
+    // bị spam alert hay làm sai counter ngày thật.
+    if (isLowScoreSkip && !dry) {
+      await maybeAlertSkippedSlot(env, runId, pick.skippedLowScore);
+    }
+
     return { runId, posted: false, attempted: 0, reason };
   }
 
@@ -708,6 +850,7 @@ export default {
         DEFAULT_QUOTA.research +
         DEFAULT_QUOTA.trend;
       const recent = await getRecentTitles(env);
+      const skippedSlotCount = await getSkippedSlotCount(env.POSTED_KV, dayKey);
       const body = {
         dayKey,
         usage,
@@ -715,6 +858,11 @@ export default {
         totalToday,
         totalQuota,
         usageStr: formatUsage(usage),
+        // Task 6: số slot bị skip do "all candidates below MIN_SCORE_THRESHOLD"
+        // hôm nay + ngưỡng cảnh báo. Cảnh báo Telegram đã gửi khi
+        // skippedSlotCount >= alertThreshold (xem maybeAlertSkippedSlot).
+        skippedSlotCount,
+        skippedSlotAlertThreshold: SKIP_ALERT_THRESHOLD,
         recentTitlesCount: recent.length,
         recentTitlesPreview: recent.slice(0, 10).map((r) => ({
           raw: r.raw,

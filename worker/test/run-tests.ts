@@ -1249,3 +1249,92 @@ test("probeKvRoundTrip: error message truncated to 200 chars", async () => {
   const ops = await probeKvRoundTrip(kv, "k", "v");
   assert.equal(ops[0].error?.length, 200);
 });
+
+// ────────────────────────────────────────────────────────────────────────────
+// Task 6: skipped-slot counter + sendAdminAlert no-op
+// ────────────────────────────────────────────────────────────────────────────
+
+import {
+  incrementSkippedSlotCount,
+  getSkippedSlotCount,
+  wasAdminAlertSent,
+  markAdminAlertSent,
+  type SkipCounterKv,
+} from "../src/skipCounter.ts";
+
+test("incrementSkippedSlotCount: count tăng đúng + ghi key skipped:<dayKey>", async () => {
+  const store = new Map<string, string>();
+  let lastTtl: number | undefined;
+  const kv: SkipCounterKv = {
+    put: async (k, v, opts) => { store.set(k, v); lastTtl = opts?.expirationTtl; },
+    get: async (k) => store.get(k) ?? null,
+  };
+  const day = "2026-04-29";
+
+  assert.equal(await getSkippedSlotCount(kv, day), 0, "ngày chưa có entry → 0");
+
+  assert.equal(await incrementSkippedSlotCount(kv, day), 1);
+  assert.equal(await incrementSkippedSlotCount(kv, day), 2);
+  assert.equal(await incrementSkippedSlotCount(kv, day), 3);
+
+  assert.equal(await getSkippedSlotCount(kv, day), 3);
+  assert.equal(store.get("skipped:2026-04-29"), "3");
+  // TTL phải được set (~36h) để counter auto-reset mỗi ngày, KHÔNG vĩnh viễn.
+  assert.ok(lastTtl && lastTtl >= 24 * 3600 && lastTtl <= 48 * 3600,
+    `TTL phải nằm trong [24h, 48h], thực tế = ${lastTtl}`);
+});
+
+test("incrementSkippedSlotCount: counter mỗi ngày độc lập", async () => {
+  const store = new Map<string, string>();
+  const kv: SkipCounterKv = {
+    put: async (k, v) => { store.set(k, v); },
+    get: async (k) => store.get(k) ?? null,
+  };
+  await incrementSkippedSlotCount(kv, "2026-04-29");
+  await incrementSkippedSlotCount(kv, "2026-04-29");
+  await incrementSkippedSlotCount(kv, "2026-04-30");
+  assert.equal(await getSkippedSlotCount(kv, "2026-04-29"), 2);
+  assert.equal(await getSkippedSlotCount(kv, "2026-04-30"), 1);
+});
+
+test("getSkippedSlotCount: corrupt value (NaN) → trả 0 an toàn", async () => {
+  const store = new Map<string, string>([["skipped:2026-04-29", "abc"]]);
+  const kv: SkipCounterKv = {
+    put: async (k, v) => { store.set(k, v); },
+    get: async (k) => store.get(k) ?? null,
+  };
+  assert.equal(await getSkippedSlotCount(kv, "2026-04-29"), 0);
+});
+
+test("getSkippedSlotCount: empty / missing → 0", async () => {
+  const kv: SkipCounterKv = {
+    put: async () => undefined,
+    get: async () => null,
+  };
+  assert.equal(await getSkippedSlotCount(kv, "2026-05-01"), 0);
+});
+
+test("wasAdminAlertSent / markAdminAlertSent: flag flow + TTL + day-isolation", async () => {
+  const store = new Map<string, string>();
+  let lastTtl: number | undefined;
+  const kv: SkipCounterKv = {
+    put: async (k, v, opts) => { store.set(k, v); lastTtl = opts?.expirationTtl; },
+    get: async (k) => store.get(k) ?? null,
+  };
+  // Default state — chưa gửi → false
+  assert.equal(await wasAdminAlertSent(kv, "2026-04-29"), false);
+
+  // Sau khi mark → true
+  await markAdminAlertSent(kv, "2026-04-29");
+  assert.equal(await wasAdminAlertSent(kv, "2026-04-29"), true);
+  assert.ok(lastTtl && lastTtl >= 24 * 3600 && lastTtl <= 48 * 3600,
+    `TTL flag phải nằm trong [24h, 48h], thực tế = ${lastTtl}`);
+
+  // Ngày khác vẫn false (KHÔNG share flag giữa các ngày)
+  assert.equal(await wasAdminAlertSent(kv, "2026-04-30"), false);
+
+  // Counter key (skipped:) và flag key (skipped_alert_sent:) là 2 namespace
+  // khác nhau → flag KHÔNG ăn vào counter và ngược lại.
+  assert.equal(await getSkippedSlotCount(kv, "2026-04-29"), 0,
+    "set flag KHÔNG được vô tình tăng counter");
+});
