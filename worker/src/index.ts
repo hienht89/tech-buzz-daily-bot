@@ -6,7 +6,13 @@ import {
 } from "./sources.js";
 import { fetchAllSources, type Article, type SourceStat } from "./rss.js";
 import { summarizeArticle, getProviders } from "./ai.js";
-import { probeProviders } from "./diag.js";
+import {
+  probeProviders,
+  probeKvRoundTrip,
+  runKvOps,
+  summarizeKvResults,
+  type KvOpResult,
+} from "./diag.js";
 import { postArticle } from "./telegram.js";
 import { extractOgImage } from "./og.js";
 import { isRelevantArxivPaper } from "./filter.js";
@@ -297,6 +303,13 @@ export type RunResult = {
   postedSource?: string;
   postedLink?: string;
   reason?: string;
+  /**
+   * Phase 17 (P0-C): kết quả từng KV book-keeping write SAU khi Telegram
+   * publish thành công. Bubble lên RunResult để admin curl /run thấy ngay
+   * write nào fail (không phải mò log). Undefined nếu run không post được
+   * (vd dry-run, all candidates fail).
+   */
+  kvWrites?: KvOpResult[];
 };
 
 /**
@@ -465,20 +478,18 @@ async function runBotInternal(
     try {
       console.log(`${tag}   Posting to Telegram...`);
       await postArticle(article, summary, env);
-      await clearFailCount(env, article.link).catch(() => undefined);
+      console.log(`${tag}   ✓ Telegram publish OK`);
 
-      // Best-effort book-keeping. Lỗi từng bước KHÔNG được throw — bài đã
-      // post lên Telegram thành công thì run này phải coi là success.
-      await markTitlePosted(env, article.title).catch((e) =>
-        console.error(`${tag}   markTitlePosted failed: ${(e as Error).message}`),
-      );
-      await pushRecentTitle(env, article.title).catch((e) =>
-        console.error(`${tag}   pushRecentTitle failed: ${(e as Error).message}`),
-      );
-      await incrementCategoryUsage(env, article.sourceCategory, dayKey).catch((e) =>
-        console.error(`${tag}   incrementCategoryUsage failed: ${(e as Error).message}`),
-      );
-      await setLastPosted(env, {
+      // ───── Bước 3.5: Book-keeping KV writes (Phase 17 — P0-C) ─────
+      // 5 write song song qua Promise.allSettled → KHÔNG nuốt lỗi mơ hồ:
+      // log per-op status + ms, bubble kết quả lên RunResult để admin curl
+      // thấy ngay write nào fail. Bài đã lên Telegram → bot LUÔN coi là
+      // success dù 1-2 write phụ fail (slot không bị mất).
+      //
+      // Lý do refactor: trước đây 4 `.catch(log)` tuần tự → khi quota AI
+      // chết, không ai thấy là KV cũng có thể đang fail. Giờ /run trả về
+      // kvWrites[] luôn, không cần wrangler tail.
+      const lastPostedPayload = {
         title: summary.title,
         source: article.source,
         link: article.link,
@@ -486,12 +497,29 @@ async function runBotInternal(
         score: article.score ?? 0,
         postedAt: new Date().toISOString(),
         provider: aiProvider,
-      }).catch((e) =>
-        console.error(`${tag}   setLastPosted failed: ${(e as Error).message}`),
-      );
+      };
+      const kvWrites = await runKvOps([
+        { name: "clearFailCount", op: () => clearFailCount(env, article.link) },
+        { name: "markTitlePosted", op: () => markTitlePosted(env, article.title) },
+        { name: "pushRecentTitle", op: () => pushRecentTitle(env, article.title) },
+        {
+          name: "incrementCategoryUsage",
+          op: () => incrementCategoryUsage(env, article.sourceCategory, dayKey),
+        },
+        { name: "setLastPosted", op: () => setLastPosted(env, lastPostedPayload) },
+      ]);
+      const sum = summarizeKvResults(kvWrites);
+      if (sum.failCount === 0) {
+        console.log(`${tag}   📝 KV book-keeping ${sum.statusLine}`);
+      } else {
+        console.error(`${tag}   ⚠️ KV book-keeping ${sum.statusLine}`);
+        console.error(`${tag}   ⚠️ ${sum.failDetail}`);
+      }
 
       console.log(
-        `${tag}   ✅ Posted successfully. [${article.sourceCategory}, score=${article.score ?? 0}, provider=${aiProvider}]`,
+        `${tag}   ✅ Posted successfully. [${article.sourceCategory}, ` +
+          `score=${article.score ?? 0}, provider=${aiProvider}, ` +
+          `kvWrites=${sum.okCount}/${kvWrites.length}]`,
       );
       return {
         runId,
@@ -500,6 +528,7 @@ async function runBotInternal(
         postedTitle: summary.title,
         postedSource: article.source,
         postedLink: article.link,
+        kvWrites,
       };
     } catch (err) {
       console.error(
@@ -601,17 +630,36 @@ function isAuthorized(req: Request, env: Env): boolean {
 
 export default {
   async scheduled(
-    _controller: ScheduledController,
+    controller: ScheduledController,
     env: Env,
     ctx: ExecutionContext,
   ): Promise<void> {
     const startedAt = new Date().toISOString();
-    console.log(`[bot] Cron triggered at ${startedAt} (UTC)`);
+    // Phase 17: log cron meta (cron expression + scheduled time) để admin
+    // distinguish "cron không fire" vs "cron fire nhưng pipeline fail".
+    console.log(
+      `[bot] Cron triggered at ${startedAt} (UTC). cronExpr=${controller.cron} ` +
+        `scheduledTime=${new Date(controller.scheduledTime).toISOString()}`,
+    );
     ctx.waitUntil(
-      runBot(env).catch((err) => {
-        // runBot không nên throw, nhưng phòng lỗi lập trình.
-        console.error("[bot] FATAL (cron):", err);
-      }),
+      runBot(env)
+        .then((result) => {
+          // Echo final decision lên log để cron-only run cũng có summary 1 dòng
+          // (trước đây chỉ /run mới thấy RunResult).
+          console.log(
+            `[bot:${result.runId}] Cron run finished. posted=${result.posted} ` +
+              `attempted=${result.attempted}` +
+              (result.postedTitle ? ` title="${result.postedTitle.slice(0, 80)}"` : "") +
+              (result.reason ? ` reason="${result.reason.slice(0, 200)}"` : "") +
+              (result.kvWrites
+                ? ` kvWrites=${result.kvWrites.filter((k) => k.ok).length}/${result.kvWrites.length}`
+                : ""),
+          );
+        })
+        .catch((err) => {
+          // runBot không nên throw, nhưng phòng lỗi lập trình.
+          console.error("[bot] FATAL (cron):", err);
+        }),
     );
   },
 
@@ -794,6 +842,55 @@ export default {
       );
     }
 
+    // ───── /debug_kv: round-trip probe KV namespace (cần auth) ─────
+    // Phase 17 (P1): write key tạm 60s TTL → read back → delete. Trả về
+    // per-op latency + matched. Mục đích: xác minh ngay binding POSTED_KV
+    // production có ghi/đọc thực sự được không, mà không cần phải đợi 1 cron
+    // tick rồi grep wrangler tail.
+    //
+    // Eventual consistency: KV cache edge có thể chưa thấy write ngay → `get`
+    // có thể trả null (matched=false) dù `put.ok=true`. Đó vẫn là tín hiệu
+    // KV nhận write OK (binding sống). Chỉ alarm khi `put.ok=false`.
+    if (url.pathname === "/debug_kv") {
+      if (!isAuthorized(req, env)) {
+        return new Response("Unauthorized\n", { status: 401 });
+      }
+      const testKey = `__diag_kv:${Date.now()}:${crypto.randomUUID().slice(0, 8)}`;
+      const testValue = JSON.stringify({
+        nonce: crypto.randomUUID(),
+        writtenAt: new Date().toISOString(),
+      });
+      const ops = await probeKvRoundTrip(env.POSTED_KV, testKey, testValue);
+      const putOp = ops.find((o) => o.op === "put");
+      const getOp = ops.find((o) => o.op === "get");
+      const allOk = ops.every((o) => o.ok);
+      const summary = !putOp?.ok
+        ? "❌ KV PUT failed — binding broken hoặc namespace mismatch"
+        : getOp && getOp.ok && getOp.matched === false
+          ? "⚠️ KV PUT OK nhưng GET trả null/khác — eventual consistency, " +
+            "thử lại sau vài giây nếu cần verify chắc"
+          : allOk
+            ? "✅ KV round-trip OK"
+            : "⚠️ Một vài op fail — xem chi tiết";
+      return new Response(
+        JSON.stringify(
+          {
+            kvBinding: "POSTED_KV",
+            testKey,
+            ops,
+            summary,
+            checkedAt: new Date().toISOString(),
+          },
+          null,
+          2,
+        ),
+        {
+          status: putOp?.ok ? 200 : 500,
+          headers: { "Content-Type": "application/json" },
+        },
+      );
+    }
+
     // ───── /run: manual trigger (cần auth) ─────
     // Alias /force_fetch (Phase 13) — cùng logic, tên khác cho admin tiện gọi.
     if (url.pathname === "/run" || url.pathname === "/force_fetch") {
@@ -854,7 +951,8 @@ export default {
         "  GET  /stats     (Bearer)      — bucket usage hôm nay + recent titles\n" +
         "  GET  /last      (Bearer)      — snapshot bài đăng gần nhất\n" +
         "  GET  /top_today (Bearer)      — top 10 candidate eligible + topPreGate (top 10 trước MIN_SCORE_THRESHOLD)\n" +
-        "  GET  /diag_ai   (Bearer)      — Phase 16: probe từng AI provider, trả {provider, ok, ms, error}\n",
+        "  GET  /diag_ai   (Bearer)      — Phase 16: probe từng AI provider, trả {provider, ok, ms, error}\n" +
+        "  GET  /debug_kv  (Bearer)      — Phase 17: round-trip POSTED_KV (put→get→delete) verify binding sống\n",
       { status: 200, headers: { "Content-Type": "text/plain" } },
     );
   },

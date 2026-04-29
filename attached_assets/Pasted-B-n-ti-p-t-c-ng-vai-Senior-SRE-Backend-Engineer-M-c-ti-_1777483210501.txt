@@ -1,0 +1,130 @@
+Bạn tiếp tục đóng vai **Senior SRE + Backend Engineer**.
+
+Mục tiêu lần này là xử lý **2 vấn đề production ưu tiên cao nhất** đã được RCA xác nhận:
+
+1. **AI summarize fail do quota/provider exhaustion**, khiến bot không post được từ khoảng 08:00 UTC trở đi.
+2. **KV observability/state không phản ánh thực tế**, vì kênh có bài đã post nhưng `/stats` và `/last` vẫn trống.
+
+## Ưu tiên công việc
+
+Làm theo đúng thứ tự sau:
+
+### P0-A. Tăng AI quota / resilience
+
+* Kiểm tra code hiện tại đã hỗ trợ nhiều Google API key chưa.
+* Nếu đã hỗ trợ `GOOGLE_API_KEY_1`, `GOOGLE_API_KEY_2` hoặc cơ chế tương tự, hãy:
+
+  * xác nhận tên secret/env cần dùng
+  * cập nhật tài liệu cấu hình thật rõ
+  * nếu cần sửa nhỏ để rotation chắc chắn hoạt động thì sửa
+* Mục tiêu: bot không chết chỉ vì 1 key cạn quota.
+
+### P0-B. Xác minh KV namespace production
+
+* Kiểm tra binding KV hiện tại trong code/config/deploy.
+* Xác minh worker production đang dùng đúng namespace expected.
+* Xác minh endpoint đọc và pipeline write đang dùng cùng binding.
+* Nếu phát hiện mismatch namespace / environment, sửa ngay.
+
+### P0-C. Điều tra và sửa KV write observability
+
+Hiện nghi ngờ 4 KV writes sau Telegram đang fail silent do `.catch(log)`.
+
+Hãy:
+
+* đọc lại toàn bộ code path sau Telegram publish success
+* xác định chính xác các chỗ:
+
+  * `markTitlePosted`
+  * `pushRecentTitle`
+  * `incrementCategoryUsage`
+  * `setLastPosted`
+* thay cơ chế “silent catch” bằng cách dễ quan sát hơn:
+
+  * `Promise.allSettled`
+  * log rõ từng key nào write success/fail
+  * không nuốt lỗi một cách mơ hồ
+* vẫn phải đảm bảo bot không crash toàn bộ chỉ vì 1 write phụ fail
+* nhưng observability phải rõ ràng
+
+### P1. Thêm debug endpoint kiểm tra KV round-trip
+
+Tạo endpoint debug an toàn, ví dụ `/debug_kv` hoặc tên phù hợp, chỉ dành cho admin/dev.
+
+Endpoint này cần:
+
+* write 1 key tạm
+* read lại key đó
+* trả kết quả round-trip
+* xóa key nếu cần
+* giúp xác minh ngay KV production có ghi/đọc được thật hay không
+
+### P1. Bổ sung log production hữu ích
+
+Tăng log tại các điểm:
+
+* cron start
+* candidate count
+* AI summarize success/fail per candidate
+* Telegram send success/fail
+* từng KV write success/fail
+* final decision: posted / skipped / failed
+
+Mục tiêu:
+
+* lần sau chỉ cần xem log là biết bot chết ở đâu
+
+---
+
+## Không làm trong task này
+
+* KHÔNG tuning scoring/editorial
+* KHÔNG đổi bucket quota
+* KHÔNG làm dynamic source discovery
+* KHÔNG refactor lớn không cần thiết
+
+---
+
+## Yêu cầu thực hiện
+
+1. Phân tích code path hiện tại
+2. Sửa tối thiểu nhưng đủ chắc
+3. Giữ backward compatibility
+4. Chạy test + typecheck
+5. Nếu có thể, chạy smoke test:
+
+   * `/health`
+   * `/stats`
+   * `/last`
+   * `/top_today`
+   * endpoint debug KV mới
+   * 1 dry-run
+6. Nếu an toàn, test 1 run thật để xác minh:
+
+   * bot post được
+   * `/stats` tăng
+   * `/last` có dữ liệu
+
+---
+
+## Output bắt buộc
+
+Sau khi xong, trả về:
+
+1. danh sách file đã sửa
+2. root cause đã được chốt lại thế nào
+3. thay đổi nào xử lý AI quota/resilience
+4. thay đổi nào xử lý KV observability/write
+5. cách cấu hình thêm Google API key dự phòng
+6. kết quả test cuối cùng:
+
+   * bot có post lại được không
+   * `/stats` còn bị 0 sai không
+   * `/last` còn rỗng không
+
+Bắt đầu bằng:
+
+* đọc code path AI provider rotation
+* đọc code path post-success KV writes
+* kiểm tra KV binding production
+* rồi sửa theo thứ tự P0-A, P0-B, P0-C

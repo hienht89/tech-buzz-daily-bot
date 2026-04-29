@@ -802,7 +802,15 @@ test("ai.classifyHttpError: 408 → non-fatal (timeout retryable)", () => {
 // Phase 16: probeProviders (powers /diag_ai endpoint)
 // ────────────────────────────────────────────────────────────────────────────
 
-import { probeProviders, type DiagProviderResult } from "../src/diag.ts";
+import {
+  probeProviders,
+  probeKvRoundTrip,
+  runKvOps,
+  summarizeKvResults,
+  type DiagProviderResult,
+  type KvLike,
+  type KvOpResult,
+} from "../src/diag.ts";
 
 const stubArticle = {
   title: "stub",
@@ -860,4 +868,158 @@ test("probeProviders: error message truncated to 400 chars", async () => {
 test("probeProviders: empty provider list → empty result (no crash)", async () => {
   const results = await probeProviders([], stubArticle);
   assert.deepEqual(results, []);
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// Phase 17: runKvOps + summarizeKvResults (powers post-Telegram book-keeping)
+// ────────────────────────────────────────────────────────────────────────────
+
+test("runKvOps: all success → all ok=true with ms ≥ 0", async () => {
+  const results = await runKvOps([
+    { name: "a", op: async () => undefined },
+    { name: "b", op: async () => undefined },
+  ]);
+  assert.equal(results.length, 2);
+  assert.equal(results[0].name, "a");
+  assert.equal(results[0].ok, true);
+  assert.equal(results[0].error, undefined);
+  assert.ok(results[0].ms >= 0);
+  assert.equal(results[1].ok, true);
+});
+
+test("runKvOps: 1 op throw → that op ok=false, others vẫn chạy", async () => {
+  const results = await runKvOps([
+    { name: "good", op: async () => undefined },
+    { name: "bad", op: async () => { throw new Error("KV write failed: 503"); } },
+    { name: "alsoGood", op: async () => undefined },
+  ]);
+  assert.equal(results.length, 3);
+  assert.equal(results[0].ok, true);
+  assert.equal(results[1].ok, false);
+  assert.match(results[1].error ?? "", /503/);
+  assert.equal(results[2].ok, true, "subsequent ops phải tiếp tục dù 1 cái fail");
+});
+
+test("runKvOps: error message truncated to 200 chars", async () => {
+  const longMsg = "x".repeat(500);
+  const results = await runKvOps([
+    { name: "verbose", op: async () => { throw new Error(longMsg); } },
+  ]);
+  assert.equal(results[0].ok, false);
+  assert.equal(results[0].error?.length, 200);
+});
+
+test("runKvOps: empty list → empty result (no crash)", async () => {
+  const results = await runKvOps([]);
+  assert.deepEqual(results, []);
+});
+
+test("summarizeKvResults: all OK → failCount=0, no failDetail", () => {
+  const results: KvOpResult[] = [
+    { name: "a", ok: true, ms: 12 },
+    { name: "b", ok: true, ms: 8 },
+  ];
+  const sum = summarizeKvResults(results);
+  assert.equal(sum.okCount, 2);
+  assert.equal(sum.failCount, 0);
+  assert.equal(sum.failDetail, undefined);
+  assert.match(sum.statusLine, /2\/2 OK/);
+  assert.match(sum.statusLine, /a=ok\(12ms\)/);
+  assert.match(sum.statusLine, /b=ok\(8ms\)/);
+});
+
+test("summarizeKvResults: mixed → failCount accurate, failDetail liệt kê tên+error", () => {
+  const results: KvOpResult[] = [
+    { name: "markTitlePosted", ok: true, ms: 20 },
+    { name: "setLastPosted", ok: false, ms: 5000, error: "KV timeout" },
+    { name: "pushRecentTitle", ok: false, ms: 12, error: "rate limited" },
+  ];
+  const sum = summarizeKvResults(results);
+  assert.equal(sum.okCount, 1);
+  assert.equal(sum.failCount, 2);
+  assert.match(sum.statusLine, /1\/3 OK/);
+  assert.match(sum.statusLine, /markTitlePosted=ok/);
+  assert.match(sum.statusLine, /setLastPosted=FAIL/);
+  assert.match(sum.failDetail ?? "", /setLastPosted: KV timeout/);
+  assert.match(sum.failDetail ?? "", /pushRecentTitle: rate limited/);
+});
+
+test("summarizeKvResults: empty list → 0/0 OK, no failDetail", () => {
+  const sum = summarizeKvResults([]);
+  assert.equal(sum.okCount, 0);
+  assert.equal(sum.failCount, 0);
+  assert.equal(sum.failDetail, undefined);
+  assert.match(sum.statusLine, /0\/0 OK/);
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// Phase 17: probeKvRoundTrip (powers /debug_kv endpoint)
+// ────────────────────────────────────────────────────────────────────────────
+
+/** Minimal in-memory KV fake để test probeKvRoundTrip. */
+function makeFakeKv(overrides: Partial<KvLike> = {}): KvLike {
+  const store = new Map<string, string>();
+  return {
+    put: async (k, v) => { store.set(k, v); },
+    get: async (k) => store.get(k) ?? null,
+    delete: async (k) => { store.delete(k); },
+    ...overrides,
+  };
+}
+
+test("probeKvRoundTrip: happy path → 3 ops all ok, get matched=true", async () => {
+  const kv = makeFakeKv();
+  const ops = await probeKvRoundTrip(kv, "test-key", "test-val");
+  assert.equal(ops.length, 3);
+  assert.equal(ops[0].op, "put");
+  assert.equal(ops[0].ok, true);
+  assert.equal(ops[1].op, "get");
+  assert.equal(ops[1].ok, true);
+  assert.equal(ops[1].matched, true);
+  assert.equal(ops[2].op, "delete");
+  assert.equal(ops[2].ok, true);
+});
+
+test("probeKvRoundTrip: PUT fail → short-circuit, không thử get/delete", async () => {
+  const kv = makeFakeKv({
+    put: async () => { throw new Error("namespace not bound"); },
+  });
+  const ops = await probeKvRoundTrip(kv, "k", "v");
+  assert.equal(ops.length, 1, "PUT fail phải short-circuit");
+  assert.equal(ops[0].op, "put");
+  assert.equal(ops[0].ok, false);
+  assert.match(ops[0].error ?? "", /namespace not bound/);
+});
+
+test("probeKvRoundTrip: GET trả null (eventual consistency) → put.ok=true, get.matched=false", async () => {
+  const kv = makeFakeKv({
+    put: async () => undefined, // accept write nhưng không lưu
+    get: async () => null,
+  });
+  const ops = await probeKvRoundTrip(kv, "k", "v");
+  assert.equal(ops.length, 3);
+  assert.equal(ops[0].ok, true, "PUT vẫn báo ok dù backend không actually persist");
+  assert.equal(ops[1].ok, true, "GET không throw → ok=true");
+  assert.equal(ops[1].matched, false, "Read-back không khớp → matched=false");
+});
+
+test("probeKvRoundTrip: GET throw → put OK, get fail, delete vẫn chạy", async () => {
+  const kv = makeFakeKv({
+    get: async () => { throw new Error("read timeout"); },
+  });
+  const ops = await probeKvRoundTrip(kv, "k", "v");
+  assert.equal(ops.length, 3);
+  assert.equal(ops[0].ok, true);
+  assert.equal(ops[1].ok, false);
+  assert.match(ops[1].error ?? "", /read timeout/);
+  assert.equal(ops[2].ok, true);
+});
+
+test("probeKvRoundTrip: error message truncated to 200 chars", async () => {
+  const longMsg = "y".repeat(600);
+  const kv = makeFakeKv({
+    put: async () => { throw new Error(longMsg); },
+  });
+  const ops = await probeKvRoundTrip(kv, "k", "v");
+  assert.equal(ops[0].error?.length, 200);
 });

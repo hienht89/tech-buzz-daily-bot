@@ -68,6 +68,14 @@ Deployed to Cloudflare Workers. Migrated từ GitHub Actions vì GH Actions cron
   - **`runBot` ghi `lastAiError` vào `RunResult.reason`**: dry-run / `/run` giờ lộ message thực của provider cuối (không cần `wrangler tail`).
   - **`/top_today` thêm `topPreGate`**: top 10 bài có score cao nhất TRƯỚC khi qua MIN_SCORE_THRESHOLD + KV check → nhìn được score thực tế của batch hiện tại.
   - **Endpoint MỚI `/diag_ai`** (cần Bearer): probe từng AI provider trên 1 article giả, KHÔNG chạm KV/Telegram/RSS. Trả `{provider, ok, ms, error}` cho từng cái — chẩn đoán "provider nào sống/chết" trong 1 request.
+- **Phase 17 (Apr 29, 2026) — KV observability + write resilience (P0-A/B/C/P1)**:
+  - **P0-A (AI quota):** xác nhận `worker/src/ai.ts` Phase 9.2 đã hỗ trợ `GOOGLE_API_KEY` + `GOOGLE_API_KEY_1.._5` rotation. Không sửa code. Hướng dẫn user trong Phase 15 vẫn áp dụng: thêm key qua `wrangler secret put GOOGLE_API_KEY_1` (mỗi key = 1 tài khoản Google = 1 quota free riêng).
+  - **P0-B (KV namespace):** xác minh binding production. `wrangler.toml` bind `POSTED_KV` → id `70ab341227fd4badb90dfa2d761dde32`; mọi read/write trong code đều qua `env.POSTED_KV`. Deploy log + `/debug_kv` đều confirm cùng namespace, không có mismatch. Bot chỉ dùng MỘT binding duy nhất → an toàn theo thiết kế.
+  - **P0-C (KV write observability):** refactor 4 `.catch(log)` tuần tự sau Telegram → `Promise.allSettled` qua helper `runKvOps()` (ở `diag.ts`). Mỗi op (clearFailCount / markTitlePosted / pushRecentTitle / incrementCategoryUsage / setLastPosted) giờ có per-op `{name, ok, ms, error}` trong log + bubble lên `RunResult.kvWrites`. Bot vẫn KHÔNG crash khi 1-2 write phụ fail (slot không bị mất), nhưng giờ thấy được fail nào ở đâu trong 1 dòng log + ngay trong response của `/run`.
+  - **P1 (`/debug_kv` endpoint):** Bearer-protected. Write key tạm 60s TTL → read back → delete. Trả per-op latency + `matched`. Verify "binding sống" trong 1 request — không cần đợi cron tick. Đã smoke-test live: `put 211ms / get 8ms matched=true / delete 241ms / ✅ KV round-trip OK`.
+  - **P1 (cron logging):** scheduled handler giờ log `cronExpr` + `scheduledTime` ở mở đầu, và 1-line summary `posted/attempted/title/reason/kvWrites` khi xong → cron-only run cũng có summary đầy đủ trong tail log (trước đây chỉ `/run` mới thấy `RunResult`).
+  - **Verify hiện tại:** `/stats` cho 2026-04-29 = `core 0/6, ai 1/5, dev 0/4, research 0/1, trend 0/2` (1 bài đã post lúc 14:01 UTC). `/last` trả đúng "🛡️ OpenAI tung chiêu bảo vệ không gian mạng thời AI" qua `gemini-2.5-flash#k0`. KV không còn rỗng.
+  - **Test:** 93/93 unit pass (thêm 12 test mới: `runKvOps`/`summarizeKvResults`/`probeKvRoundTrip` với fake KV). `tsc --noEmit` clean. Deploy `2b25dc0f-bb74-4bfa-8f7d-a132c113bf7a`.
 - **Pipeline (Phase 1-7 upgrade)**:
   1. Fetch song song 18 nguồn → strict filter cho arxiv (chỉ paper LLM/AI)
   2. Score article: `sourceWeight + recency + keyword(boost-penalty) + primaryLab + engineering + depth − hnPenalty`
@@ -112,6 +120,7 @@ Deployed to Cloudflare Workers. Migrated từ GitHub Actions vì GH Actions cron
 - `GET /last` — bài cuối + 10 run gần nhất, **cần Bearer**.
 - `GET /top_today` — top 10 candidate hiện tại + `topPreGate` (Phase 16: top 10 trước MIN_SCORE_THRESHOLD), **cần Bearer**.
 - `GET /diag_ai` — Phase 16 diagnostic: probe từng AI provider trên 1 article giả, trả `{provider, ok, ms, error}`, **cần Bearer**. Dùng để confirm "provider nào sống/chết" mà không cần đợi cron tick.
+- `GET /debug_kv` — Phase 17 diagnostic: write key tạm 60s TTL vào `POSTED_KV` → read lại → delete. Trả `{kvBinding, testKey, ops:[{op, ok, ms, matched?}], summary}`, **cần Bearer**. Verify binding KV production có ghi/đọc thực sự được không; status 500 nếu PUT fail.
 
 Ví dụ trigger thủ công:
 ```bash
