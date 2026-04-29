@@ -63,20 +63,46 @@ function isRetryableError(err: unknown): boolean {
   return msg.includes("unavailable") || msg.includes("overloaded") || msg.includes("rate");
 }
 
+// Hard timeout cho mỗi lần gọi Gemini. Nếu SDK không tự fail, request có thể
+// hang vô tận → wrapper bằng Promise.race với setTimeout.
+const GEMINI_REQUEST_TIMEOUT_MS = 30_000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${ms}ms`));
+    }, ms);
+    promise.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(t);
+        reject(e);
+      },
+    );
+  });
+}
+
 async function callGemini(article: Article): Promise<string> {
   const maxRetries = 4;
   let lastErr: unknown;
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
-      const response = await ai.models.generateContent({
-        model: MODEL,
-        contents: [{ role: "user", parts: [{ text: buildPrompt(article) }] }],
-        config: {
-          responseMimeType: "application/json",
-          maxOutputTokens: 8192,
-          temperature: 0.7,
-        },
-      });
+      const response = await withTimeout(
+        ai.models.generateContent({
+          model: MODEL,
+          contents: [{ role: "user", parts: [{ text: buildPrompt(article) }] }],
+          config: {
+            responseMimeType: "application/json",
+            maxOutputTokens: 8192,
+            temperature: 0.7,
+          },
+        }),
+        GEMINI_REQUEST_TIMEOUT_MS,
+        "Gemini generateContent",
+      );
       const text = response.text;
       if (!text) throw new Error("Gemini returned empty response");
       return text;

@@ -94,7 +94,15 @@ function getLink(item: AnyObj): string {
   return "";
 }
 
-function getPubDate(item: AnyObj): Date {
+/**
+ * Lấy pubDate từ item RSS/Atom. Nếu KHÔNG parse được, trả về EPOCH (1970)
+ * thay vì `new Date()` — vì fallback "now" sẽ PROMOTE bài cũ thiếu ngày lên
+ * đầu sort newest-first → bot pick liên tục bài đó → dễ poison loop.
+ * Dùng epoch khiến bài đó rớt xuống cuối sort + sẽ bị `isFresh()` (>48h) loại.
+ */
+const EPOCH = new Date(0);
+
+export function getPubDate(item: AnyObj): Date {
   const candidates = [item.pubDate, item.published, item.updated, item["dc:date"]];
   for (const c of candidates) {
     const s = strOrEmpty(c);
@@ -103,7 +111,7 @@ function getPubDate(item: AnyObj): Date {
       if (!isNaN(d.getTime())) return d;
     }
   }
-  return new Date();
+  return EPOCH;
 }
 
 function getImageUrl(item: AnyObj): string | undefined {
@@ -266,21 +274,43 @@ export async function fetchSource(source: RssSource): Promise<Article[]> {
 // Sau khi sort, chỉ giữ top N để giảm CPU cho filter + KV lookup.
 const TOP_ARTICLES_AFTER_SORT = 200;
 
-export async function fetchAllSources(sources: RssSource[]): Promise<Article[]> {
+export type SourceStat = {
+  name: string;
+  url: string;
+  count: number;
+  ok: boolean;
+};
+
+export type FetchAllResult = {
+  articles: Article[];
+  stats: SourceStat[];
+};
+
+export async function fetchAllSources(
+  sources: RssSource[],
+): Promise<FetchAllResult> {
   const results = await Promise.all(sources.map(fetchSource));
 
-  // Log per-source counts để dễ debug khi không có bài
-  const stats = sources
-    .map((s, i) => `${s.name}=${results[i].length}`)
-    .join(" ");
-  console.log(`[rss] Fetched per-source: ${stats}`);
+  const stats: SourceStat[] = sources.map((s, i) => ({
+    name: s.name,
+    url: s.url,
+    count: results[i].length,
+    ok: results[i].length > 0,
+  }));
 
-  const failedCount = results.filter((r) => r.length === 0).length;
+  // Log per-source counts để dễ debug khi không có bài
+  const summary = stats.map((s) => `${s.name}=${s.count}`).join(" ");
+  console.log(`[rss] Fetched per-source: ${summary}`);
+
+  const failedCount = stats.filter((s) => !s.ok).length;
   if (failedCount > 0) {
     console.warn(`[rss] ${failedCount}/${sources.length} sources returned 0 articles`);
   }
 
   const articles = results.flat();
   articles.sort((a, b) => b.pubDate.getTime() - a.pubDate.getTime());
-  return articles.slice(0, TOP_ARTICLES_AFTER_SORT);
+  return {
+    articles: articles.slice(0, TOP_ARTICLES_AFTER_SORT),
+    stats,
+  };
 }

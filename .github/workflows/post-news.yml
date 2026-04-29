@@ -1,15 +1,25 @@
-name: Post Tech News to Telegram
+name: Post Tech News to Telegram (DEPRECATED — manual only)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ⚠️  DEPRECATED: lịch chạy tự động (cron) ĐÃ TẮT.
+#
+# Bot chính giờ chạy trên Cloudflare Workers (worker/) với cron mỗi giờ.
+# Workflow này chỉ giữ lại để chạy thủ công khi cần khẩn cấp (vd: CF Workers
+# downtime). KHÔNG bao giờ bật lại `schedule` ở dưới — sẽ chạy SONG SONG với
+# Cloudflare Worker, và 2 storage backend khác nhau (posted.json vs KV) sẽ
+# KHÔNG đồng bộ → post TRÙNG bài lên kênh.
+#
+# Cách chạy thủ công: tab Actions → workflow này → "Run workflow".
+# Trước khi chạy: TẠM TẮT cron Cloudflare Worker (`wrangler triggers ...` hoặc
+# remove cron trong wrangler.toml + redeploy) để tránh dupe.
+# ─────────────────────────────────────────────────────────────────────────────
 
 on:
-  schedule:
-    # Chạy ở phút 45 các giờ lẻ UTC (1, 3, 5, ..., 23) — sớm 15 phút trước mốc giờ chẵn UTC.
-    # Mục đích: đăng ĐÚNG mốc giờ lẻ Việt Nam (1:00, 3:00, 5:00... UTC+7).
-    # Bot sẽ tự sleep tới đúng mốc giờ rồi mới đăng (bù trừ delay của GitHub Actions).
-    - cron: "45 1-23/2 * * *"
-  workflow_dispatch: # Cho phép chạy thủ công từ tab Actions
+  # schedule: ĐÃ TẮT — xem lý do ở comment trên.
+  workflow_dispatch:
 
 permissions:
-  contents: write # Cần để commit posted.json về repo
+  contents: write # Cần để commit posted.json về repo (chỉ khi chạy manual)
 
 concurrency:
   group: post-news
@@ -18,7 +28,7 @@ concurrency:
 jobs:
   post:
     runs-on: ubuntu-latest
-    timeout-minutes: 40 # đủ chỗ cho bot sleep tới mốc giờ (tối đa 30 phút) + đăng bài
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -48,7 +58,7 @@ jobs:
         run: pnpm --filter @workspace/scripts run post-news
 
       - name: Commit posted history
-        if: always() # commit dù bot fail (có thể đã post xong nhưng crash sau đó)
+        if: always()
         run: |
           set -e
           git config user.name "tech-buzz-bot"
@@ -62,7 +72,6 @@ jobs:
           git add scripts/data/posted.json
           git commit -m "chore: update posted history [skip ci]"
 
-          # Retry push lên đến 5 lần với rebase nếu remote đã thay đổi
           for attempt in 1 2 3 4 5; do
             if git push; then
               echo "Push thành công ở lần thử $attempt"
@@ -73,5 +82,5 @@ jobs:
             sleep $((attempt * 3))
           done
 
-          echo "::error::Không push được posted.json sau 5 lần thử — bài có thể bị đăng lại trong lần chạy sau!"
+          echo "::error::Không push được posted.json sau 5 lần thử."
           exit 1

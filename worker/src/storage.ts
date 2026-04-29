@@ -1,4 +1,5 @@
 import type { Env } from "./index.js";
+import { normalizeUrl } from "./url.js";
 
 const POSTED_PREFIX = "posted:";
 const FAIL_PREFIX = "failed:";
@@ -16,8 +17,14 @@ type PostedValue = {
   postedAt: string;
 };
 
+/**
+ * Hash URL ĐÃ NORMALIZE (strip utm_*, fbclid, fragment, sort params, ...).
+ * Đảm bảo cùng 1 article xuất hiện với nhiều variant URL khác nhau (rss vs share
+ * vs embedded link với utm khác) sẽ ánh xạ về cùng 1 key.
+ */
 async function urlHash(url: string): Promise<string> {
-  const buf = new TextEncoder().encode(url);
+  const canonical = normalizeUrl(url);
+  const buf = new TextEncoder().encode(canonical);
   const hash = await crypto.subtle.digest("SHA-1", buf);
   return Array.from(new Uint8Array(hash))
     .map((b) => b.toString(16).padStart(2, "0"))

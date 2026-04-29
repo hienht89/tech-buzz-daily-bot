@@ -3,7 +3,7 @@ import {
   isTechRelevantUrl,
   isTechRelevantTitle,
 } from "./sources.js";
-import { fetchAllSources, type Article } from "./rss.js";
+import { fetchAllSources, type Article, type SourceStat } from "./rss.js";
 import { summarizeArticle } from "./ai.js";
 import { postArticle } from "./telegram.js";
 import {
@@ -31,114 +31,298 @@ export interface Env {
   RUN_TRIGGER_TOKEN?: string;
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Constants
+// ────────────────────────────────────────────────────────────────────────────
+
 const MAX_AGE_HOURS = 48;
+
+/**
+ * Số lượng candidate tối đa thử trong 1 lần chạy.
+ * Nếu Gemini hoặc Telegram fail bài đầu, bot sẽ tự thử tiếp bài tiếp theo
+ * cho đến khi post thành công hoặc hết MAX_CANDIDATES_PER_RUN.
+ * Tránh trường hợp 1 bài hỏng làm miss cả slot.
+ */
+const MAX_CANDIDATES_PER_RUN = 5;
+
+// ────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ────────────────────────────────────────────────────────────────────────────
 
 function isFresh(article: Article): boolean {
   return Date.now() - article.pubDate.getTime() <= MAX_AGE_HOURS * 60 * 60 * 1000;
 }
 
-async function pickArticle(env: Env): Promise<Article | null> {
-  console.log(`[bot] Fetching ${RSS_SOURCES.length} RSS sources...`);
-  const allArticles = await fetchAllSources(RSS_SOURCES);
-  console.log(`[bot] Fetched ${allArticles.length} total articles (top-N after sort)`);
+function shortRunId(): string {
+  // 8 hex chars là đủ unique cho mỗi cron tick
+  return crypto.randomUUID().slice(0, 8);
+}
 
-  // Lọc tách bước để log từng giai đoạn — biết bài nào bị loại vì lý do gì.
-  const fresh = allArticles.filter(isFresh);
+/**
+ * Single-flight mutex Ở MỨC ISOLATE. Đảm bảo trong cùng 1 Worker isolate (cùng
+ * 1 instance đang warm), CHỈ 1 lần runBot chạy cùng lúc. Áp dụng cho trường
+ * hợp manual `/run` được trigger gần như cùng lúc với cron trigger.
+ *
+ * HẠN CHẾ: nếu Cloudflare load-balance cron và fetch tới 2 isolate khác nhau
+ * (vd 2 datacenter khác nhau), mutex này KHÔNG bảo vệ được. Race giữa 2
+ * isolate là KÝ ƯU NHỎ vì:
+ *   - Cron fire ở 1 thời điểm (top-of-hour), manual trigger hiếm
+ *   - KV `isPosted` re-check ngay trước reservePost vẫn catch hầu hết trường hợp
+ *   - Bot tự nhận chỉ 18 post/ngày → cửa sổ race ~ms / mỗi 1h
+ * Nếu cần bảo đảm tuyệt đối → cần Durable Objects (overhead + chi phí cao hơn,
+ * không cần thiết cho scale hiện tại).
+ */
+let inflightRun: Promise<RunResult> | null = null;
+
+type PickResult = {
+  candidates: Article[];
+  stats: SourceStat[];
+  totalFetched: number;
+  freshCount: number;
+  techCount: number;
+};
+
+/**
+ * Lấy DANH SÁCH (không phải 1 bài) candidates đã pass mọi filter và CHƯA đăng.
+ * Caller (runBot) sẽ thử từng bài cho đến khi 1 bài post thành công.
+ *
+ * Filter pipeline (theo thứ tự, để log chỉ rõ stage nào loại nhiều bài):
+ *  1. fresh: pubDate trong 48h
+ *  2. tech-relevant URL (path không match blacklist)
+ *  3. tech-relevant title (không match keyword blacklist)
+ *  4. chưa được đăng (KV check)
+ *  5. không phải poison article (fail count < MAX)
+ */
+async function pickCandidates(env: Env, runId: string): Promise<PickResult> {
+  console.log(`[bot:${runId}] Fetching ${RSS_SOURCES.length} RSS sources...`);
+  const { articles, stats } = await fetchAllSources(RSS_SOURCES);
+  console.log(`[bot:${runId}] Fetched ${articles.length} articles (top-N after sort)`);
+
+  const fresh = articles.filter(isFresh);
   const techUrl = fresh.filter((a) => isTechRelevantUrl(a.link));
-  const candidates = techUrl.filter((a) => isTechRelevantTitle(a.title));
+  const techTitle = techUrl.filter((a) => isTechRelevantTitle(a.title));
   console.log(
-    `[bot] Filter pipeline: total=${allArticles.length} fresh=${fresh.length} ` +
-      `tech-url=${techUrl.length} tech-title=${candidates.length}`,
+    `[bot:${runId}] Filter pipeline: total=${articles.length} fresh=${fresh.length} ` +
+      `tech-url=${techUrl.length} tech-title=${techTitle.length}`,
   );
 
-  if (candidates.length === 0) {
-    console.warn(
-      "[bot] No candidates after filtering. Có thể: (1) tất cả nguồn RSS fail, " +
-        "(2) tin quá cũ (>48h), (3) filter từ khóa quá chặt.",
-    );
-    return null;
+  if (techTitle.length === 0) {
+    return {
+      candidates: [],
+      stats,
+      totalFetched: articles.length,
+      freshCount: fresh.length,
+      techCount: techTitle.length,
+    };
   }
 
-  // Đi từ bài mới nhất xuống, bỏ qua: (a) đã đăng, (b) poison (fail >= MAX).
-  let checked = 0;
+  // KV check (đã đăng) + poison check, trên TOÀN BỘ tech-relevant article
+  // (không break sớm — runBot cần list để retry).
+  const candidates: Article[] = [];
   let skippedPosted = 0;
   let skippedPoison = 0;
-  for (const a of candidates) {
-    checked++;
+  for (const a of techTitle) {
     if (await isPosted(env, a.link)) {
       skippedPosted++;
       continue;
     }
-    const failCount = await getFailCount(env, a.link);
-    if (failCount >= MAX_FAIL_BEFORE_SKIP) {
+    const fc = await getFailCount(env, a.link);
+    if (fc >= MAX_FAIL_BEFORE_SKIP) {
       skippedPoison++;
-      console.warn(
-        `[bot] Skipping poison article (fail=${failCount}): "${a.title.slice(0, 80)}"`,
-      );
       continue;
     }
-    console.log(
-      `[bot] Picked after checking ${checked}/${candidates.length} ` +
-        `(skipped: ${skippedPosted} posted, ${skippedPoison} poison)`,
-    );
-    return a;
+    candidates.push(a);
+    // Đã có đủ MAX_CANDIDATES_PER_RUN thì stop sớm (tiết kiệm KV reads)
+    if (candidates.length >= MAX_CANDIDATES_PER_RUN) break;
   }
-  console.warn(
-    `[bot] No usable article in ${candidates.length} candidates ` +
-      `(${skippedPosted} đã đăng, ${skippedPoison} poison). Đợi cron tiếp.`,
+
+  console.log(
+    `[bot:${runId}] Eligible candidates: ${candidates.length} ` +
+      `(skipped: ${skippedPosted} đã đăng, ${skippedPoison} poison)`,
   );
-  return null;
+
+  return {
+    candidates,
+    stats,
+    totalFetched: articles.length,
+    freshCount: fresh.length,
+    techCount: techTitle.length,
+  };
 }
 
-async function runBot(env: Env): Promise<void> {
-  const article = await pickArticle(env);
-  if (!article) {
-    console.log("[bot] No fresh unposted article found. Skipping this run.");
-    return;
+export type RunResult = {
+  runId: string;
+  posted: boolean;
+  attempted: number;
+  postedTitle?: string;
+  postedSource?: string;
+  postedLink?: string;
+  reason?: string;
+};
+
+/**
+ * Internal run. Không throw ra ngoài — mọi lỗi candidate đều được catch để
+ * tiếp tục thử bài tiếp theo. Cron handler không bao giờ thấy exception.
+ */
+async function runBotInternal(
+  env: Env,
+  options: { dryRun?: boolean },
+): Promise<RunResult> {
+  const runId = shortRunId();
+  const dry = !!options.dryRun;
+  console.log(`[bot:${runId}] Run started${dry ? " (DRY RUN — sẽ KHÔNG post)" : ""}`);
+
+  const pick = await pickCandidates(env, runId);
+
+  if (pick.candidates.length === 0) {
+    const reason = pick.totalFetched === 0
+      ? "all RSS sources failed"
+      : pick.freshCount === 0
+        ? "no fresh articles (>48h)"
+        : pick.techCount === 0
+          ? "no tech-relevant articles after filter"
+          : "all candidates đã đăng hoặc poison";
+    console.warn(`[bot:${runId}] No candidate to try. Reason: ${reason}`);
+    return { runId, posted: false, attempted: 0, reason };
   }
 
-  console.log(`[bot] Selected: "${article.title}" (${article.source})`);
-  console.log(`[bot]   Link: ${article.link}`);
+  for (let i = 0; i < pick.candidates.length; i++) {
+    const article = pick.candidates[i];
+    const tag = `[bot:${runId}] (${i + 1}/${pick.candidates.length})`;
+    console.log(`${tag} Trying: "${article.title}" — ${article.source}`);
+    console.log(`${tag}   Link: ${article.link}`);
 
-  // ────────── Bước 1: Gemini summarize ──────────
-  // Nếu fail → tăng fail count nhưng KHÔNG throw để cron tiếp tự pick bài khác.
-  // Sau MAX_FAIL_BEFORE_SKIP lần, bài này sẽ bị skip trong pickArticle.
-  let summary;
-  try {
-    console.log("[bot] Generating Vietnamese summary with Gemini...");
-    summary = await summarizeArticle(article, env);
-    console.log(`[bot]   Title: ${summary.title}`);
-  } catch (err) {
-    const fc = await incrementFailCount(env, article.link).catch(() => -1);
-    console.error(
-      `[bot] Gemini failed for "${article.title}" (fail count → ${fc}): ${(err as Error).message}`,
-    );
-    return; // không throw → cron không bị mark fail, slot tiếp vẫn chạy
+    // Re-check posted ngay trước khi reserve — phòng race với 1 cron khác
+    // (vd manual /run trong khi cron đang chạy).
+    if (await isPosted(env, article.link)) {
+      console.log(`${tag}   Race detected: bài đã được claim bởi run khác. Skip.`);
+      continue;
+    }
+
+    // ───── Bước 1: Gemini summarize ─────
+    let summary;
+    try {
+      console.log(`${tag}   Summarizing with Gemini...`);
+      summary = await summarizeArticle(article, env);
+      console.log(`${tag}   Title: ${summary.title}`);
+    } catch (err) {
+      const fc = await incrementFailCount(env, article.link).catch(() => -1);
+      console.error(
+        `${tag}   Gemini fail (count→${fc}): ${(err as Error).message?.slice(0, 200)}`,
+      );
+      continue; // thử bài tiếp theo
+    }
+
+    if (dry) {
+      console.log(`${tag}   DRY RUN — would post: "${summary.title}"`);
+      return {
+        runId,
+        posted: false,
+        attempted: i + 1,
+        postedTitle: summary.title,
+        postedSource: article.source,
+        postedLink: article.link,
+        reason: "dry-run",
+      };
+    }
+
+    // ───── Bước 2: Reserve KV (claim) NGAY trước khi gọi Telegram ─────
+    // Nếu reserve fail → KHÔNG bỏ run, thử bài tiếp theo (slot vẫn còn cơ hội).
+    try {
+      await reservePost(env, article.link, summary.title);
+    } catch (err) {
+      console.error(
+        `${tag}   Reserve fail (KV write): ${(err as Error).message?.slice(0, 200)}. ` +
+          `Bỏ qua bài này, thử bài tiếp theo.`,
+      );
+      // KHÔNG increment fail count vì lỗi không phải do bài này — do KV.
+      continue;
+    }
+
+    // ───── Bước 3: Post lên Telegram ─────
+    try {
+      console.log(`${tag}   Posting to Telegram...`);
+      await postArticle(article, summary, env);
+      await clearFailCount(env, article.link).catch(() => undefined);
+      console.log(`${tag}   ✅ Posted successfully.`);
+      return {
+        runId,
+        posted: true,
+        attempted: i + 1,
+        postedTitle: summary.title,
+        postedSource: article.source,
+        postedLink: article.link,
+      };
+    } catch (err) {
+      console.error(
+        `${tag}   Telegram fail: ${(err as Error).message?.slice(0, 200)}`,
+      );
+
+      // ───── Bước 4: Rollback reservation ─────
+      // Nếu unreserve fail → posted:* key vẫn nằm trong KV 30 ngày → bài này
+      // sẽ bị skip vĩnh viễn DÙ CHƯA THỰC SỰ ĐĂNG. Đây là lỗi hệ thống
+      // nghiêm trọng cần admin can thiệp. Log thật to + KHÔNG increment fail
+      // count (vì fail count cũng vô ích — bài đã bị mark posted).
+      let unreserveOk = true;
+      try {
+        await unreservePost(env, article.link);
+      } catch (e) {
+        unreserveOk = false;
+        console.error(
+          `${tag}   ⚠️ CRITICAL: unreserve cũng fail. Bài "${article.title}" ` +
+            `(${article.link}) đã bị mark posted trong KV NHƯNG CHƯA gửi lên Telegram. ` +
+            `Sẽ bị skip 30 ngày. Cần xóa thủ công posted:<sha1(canonical)> trong KV. ` +
+            `Error: ${(e as Error).message?.slice(0, 200)}`,
+        );
+      }
+
+      if (unreserveOk) {
+        const fc = await incrementFailCount(env, article.link).catch(() => -1);
+        console.warn(`${tag}   Fail count → ${fc}`);
+      }
+      continue; // thử bài tiếp theo
+    }
   }
 
-  // ────────── Bước 2: Reserve KV NGAY trước khi gửi Telegram ──────────
-  await reservePost(env, article.link, summary.title);
+  console.warn(
+    `[bot:${runId}] Tried all ${pick.candidates.length} candidates, none succeeded.`,
+  );
+  return {
+    runId,
+    posted: false,
+    attempted: pick.candidates.length,
+    reason: "all candidates failed",
+  };
+}
 
-  // ────────── Bước 3: Post lên Telegram ──────────
-  try {
-    console.log("[bot] Posting to Telegram channel...");
-    await postArticle(article, summary, env);
-    console.log("[bot] Done!");
-    // Post thành công → xóa fail count (nếu trước đó từng fail nhưng giờ ok)
-    await clearFailCount(env, article.link).catch(() => undefined);
-  } catch (err) {
-    // Telegram fail → rollback KV reservation và tăng fail count
-    console.error(
-      `[bot] Telegram post failed; rolling back. Error: ${(err as Error).message}`,
+/**
+ * Public entry. Wrap `runBotInternal` trong single-flight mutex để 2 lần gọi
+ * trong cùng 1 isolate (vd cron + manual /run đến gần như cùng lúc) sẽ KHÔNG
+ * chạy song song → giảm rủi ro post trùng. Xem comment ở `inflightRun` trên
+ * cho hạn chế cross-isolate.
+ */
+export async function runBot(
+  env: Env,
+  options: { dryRun?: boolean } = {},
+): Promise<RunResult> {
+  if (inflightRun) {
+    console.log(
+      `[bot] Có 1 run đang chạy trong cùng isolate, đợi xong rồi mới start (single-flight).`,
     );
-    await unreservePost(env, article.link).catch((e) => {
-      console.warn(`[bot] Unreserve also failed: ${(e as Error).message}`);
-    });
-    const fc = await incrementFailCount(env, article.link).catch(() => -1);
-    console.warn(`[bot] Fail count for this URL → ${fc}`);
-    return; // không throw → slot kế cứ thử bài khác
+    await inflightRun.catch(() => undefined);
+  }
+  const promise = runBotInternal(env, options);
+  inflightRun = promise;
+  try {
+    return await promise;
+  } finally {
+    if (inflightRun === promise) inflightRun = null;
   }
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Auth helpers
+// ────────────────────────────────────────────────────────────────────────────
 
 function timingSafeEqual(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
@@ -148,6 +332,18 @@ function timingSafeEqual(a: string, b: string): boolean {
   }
   return diff === 0;
 }
+
+function isAuthorized(req: Request, env: Env): boolean {
+  if (!env.RUN_TRIGGER_TOKEN) return false;
+  const auth = req.headers.get("Authorization") ?? "";
+  const match = auth.match(/^Bearer\s+(.+)$/);
+  if (!match) return false;
+  return timingSafeEqual(match[1], env.RUN_TRIGGER_TOKEN);
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Worker entry
+// ────────────────────────────────────────────────────────────────────────────
 
 export default {
   async scheduled(
@@ -159,8 +355,8 @@ export default {
     console.log(`[bot] Cron triggered at ${startedAt} (UTC)`);
     ctx.waitUntil(
       runBot(env).catch((err) => {
-        console.error("[bot] FATAL:", err);
-        throw err;
+        // runBot không nên throw, nhưng phòng lỗi lập trình.
+        console.error("[bot] FATAL (cron):", err);
       }),
     );
   },
@@ -168,12 +364,34 @@ export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(req.url);
 
+    // ───── /health: ping endpoint ─────
     if (url.pathname === "/health") {
       return new Response("ok\n", { status: 200 });
     }
 
+    // ───── /sources: source health (cần auth) ─────
+    if (url.pathname === "/sources") {
+      if (!isAuthorized(req, env)) {
+        return new Response("Unauthorized\n", { status: 401 });
+      }
+      const { stats } = await fetchAllSources(RSS_SOURCES);
+      const total = stats.length;
+      const ok = stats.filter((s) => s.ok).length;
+      const body = {
+        total,
+        ok,
+        failed: total - ok,
+        sources: stats.sort((a, b) => Number(a.ok) - Number(b.ok) || b.count - a.count),
+        checkedAt: new Date().toISOString(),
+      };
+      return new Response(JSON.stringify(body, null, 2), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    // ───── /run: manual trigger (cần auth) ─────
     if (url.pathname === "/run") {
-      // CHỈ chấp nhận POST + Authorization: Bearer <RUN_TRIGGER_TOKEN>
       if (req.method !== "POST") {
         return new Response("Method Not Allowed. Use POST.\n", {
           status: 405,
@@ -181,18 +399,37 @@ export default {
         });
       }
       if (!env.RUN_TRIGGER_TOKEN) {
-        return new Response("Manual trigger disabled (RUN_TRIGGER_TOKEN not set).\n", {
-          status: 503,
-        });
+        return new Response(
+          "Manual trigger disabled (RUN_TRIGGER_TOKEN not set).\n",
+          { status: 503 },
+        );
       }
-      const auth = req.headers.get("Authorization") ?? "";
-      const match = auth.match(/^Bearer\s+(.+)$/);
-      if (!match || !timingSafeEqual(match[1], env.RUN_TRIGGER_TOKEN)) {
+      if (!isAuthorized(req, env)) {
         return new Response("Unauthorized\n", { status: 401 });
       }
+
+      const dry = url.searchParams.get("dry") === "1" || url.searchParams.get("dry") === "true";
+
+      // Dry-run: chạy SYNC để trả kết quả về client (không post nên rất nhanh)
+      if (dry) {
+        try {
+          const result = await runBot(env, { dryRun: true });
+          return new Response(JSON.stringify(result, null, 2), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        } catch (err) {
+          return new Response(
+            JSON.stringify({ error: (err as Error).message }, null, 2),
+            { status: 500, headers: { "Content-Type": "application/json" } },
+          );
+        }
+      }
+
+      // Real run: ASYNC để không bị giới hạn 30s của fetch handler
       ctx.waitUntil(
         runBot(env).catch((err) => {
-          console.error("[bot] FATAL (manual trigger):", err);
+          console.error("[bot] FATAL (manual):", err);
         }),
       );
       return new Response(
@@ -202,7 +439,12 @@ export default {
     }
 
     return new Response(
-      "Tech Buzz Daily bot worker.\nEndpoints: GET /health, POST /run\n",
+      "Tech Buzz Daily bot worker.\n" +
+        "Endpoints:\n" +
+        "  GET  /health                 — ping\n" +
+        "  POST /run (Bearer)           — trigger ngay (async)\n" +
+        "  POST /run?dry=1 (Bearer)     — dry-run, trả về candidate sẽ chọn (KHÔNG post)\n" +
+        "  GET  /sources (Bearer)       — source health report\n",
       { status: 200, headers: { "Content-Type": "text/plain" } },
     );
   },

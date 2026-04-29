@@ -7,6 +7,13 @@ import { fetchAllSources, type Article } from "./lib/rss.js";
 import { getPostedUrls, markPosted } from "./lib/storage.js";
 import { summarizeArticle } from "./lib/ai.js";
 import { postArticle } from "./lib/telegram.js";
+import { normalizeUrl } from "./lib/url.js";
+
+/**
+ * ⚠️ DEPRECATED PATH — bot chính đã chuyển sang Cloudflare Workers (worker/).
+ * File này còn để chạy thủ công trên dev hoặc CI dispatch backup, KHÔNG nên
+ * bật cron song song với worker (sẽ dupe). Xem scripts/BOT_README.md.
+ */
 
 const MAX_AGE_HOURS = 48;
 const MAX_SLEEP_MS = 30 * 60 * 1000; // tối đa chờ 30 phút
@@ -70,9 +77,10 @@ async function pickArticle(): Promise<Article | null> {
   const posted = await getPostedUrls();
   console.log(`[bot] Have history of ${posted.size} previously posted URLs`);
 
+  // `posted` chứa URL ĐÃ NORMALIZE → phải normalize a.link trước khi check.
   const candidates = allArticles.filter(
     (a) =>
-      !posted.has(a.link) &&
+      !posted.has(normalizeUrl(a.link)) &&
       isFresh(a) &&
       isTechRelevantUrl(a.link) &&
       isTechRelevantTitle(a.title),

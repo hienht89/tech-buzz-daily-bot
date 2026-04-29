@@ -1,6 +1,22 @@
 # 🐝 Tech Buzz Daily — Telegram Bot
 
-Bot tự động lấy tin tech từ nhiều nguồn RSS, dùng Gemini AI để tóm tắt + dịch sang tiếng Việt, rồi đăng lên kênh Telegram **mỗi 2 tiếng**.
+> ## ⚠️ DEPRECATED
+>
+> Path này (`scripts/` + GitHub Actions) đã được **thay thế bởi Cloudflare Workers** (folder `worker/`). Lý do migrate:
+>
+> 1. **GitHub Actions cron drift 30–60 phút vào ban đêm** — slot post bị trễ, không đều giờ
+> 2. **Cloudflare Cron trigger chính xác trong vài giây** so với UTC scheduled time
+> 3. Worker dùng KV thay file commit về repo → tránh race condition khi nhiều tick chạy gần nhau
+>
+> **Cron của workflow GitHub Actions ĐÃ BỊ TẮT** (`.github/workflows/post-news.yml`). Chỉ còn `workflow_dispatch` để chạy tay khi cần backup.
+>
+> ❗ **KHÔNG được bật lại cron song song với Cloudflare Worker** — sẽ post trùng (dupe) vì 2 system dùng 2 storage khác nhau (file `posted.json` vs CF KV).
+>
+> Nội dung dưới đây giữ lại cho mục đích lịch sử và để dùng làm fallback nếu Cloudflare bị down. Tham khảo bot CHÍNH ở `worker/` (xem `replit.md` → mục Tech Buzz Daily Bot).
+
+---
+
+Bot tự động lấy tin tech từ 10 nguồn RSS, dùng Gemini AI để tóm tắt + dịch sang tiếng Việt, rồi đăng lên kênh Telegram. Bản worker (chính) đăng **mỗi giờ từ 7h-0h VN** (18 bài/ngày). Bản scripts này (cũ) cấu hình **mỗi 2 tiếng**.
 
 ---
 

@@ -47,6 +47,24 @@ function extractImageFromHtml(html: string | undefined): string | undefined {
   return m?.[1];
 }
 
+const EPOCH = new Date(0);
+
+/**
+ * Parse pubDate từ RSS. Trả EPOCH (1970) nếu không có hoặc không parse được —
+ * tránh promote bài thiếu ngày lên top sort newest-first.
+ */
+function parsePubDate(
+  isoDate: string | undefined,
+  pubDate: string | undefined,
+): Date {
+  for (const candidate of [isoDate, pubDate]) {
+    if (!candidate) continue;
+    const d = new Date(candidate);
+    if (!isNaN(d.getTime())) return d;
+  }
+  return EPOCH;
+}
+
 export async function fetchSource(source: RssSource): Promise<Article[]> {
   try {
     const feed = await parser.parseURL(source.url);
@@ -56,11 +74,10 @@ export async function fetchSource(source: RssSource): Promise<Article[]> {
       const link = item.link?.trim();
       const title = item.title?.trim();
       if (!link || !title) continue;
-      const pubDate = item.isoDate
-        ? new Date(item.isoDate)
-        : item.pubDate
-          ? new Date(item.pubDate)
-          : new Date();
+      // Nếu pubDate KHÔNG parse được, dùng EPOCH (1970) thay vì `new Date()`.
+      // Lý do: fallback "now" sẽ promote bài cũ thiếu ngày lên top sort
+      // newest-first → bot pick cùng 1 bài mãi → poison loop.
+      const pubDate = parsePubDate(item.isoDate, item.pubDate);
       const imageUrl =
         pickMediaUrl(item as CustomItem) ??
         extractImageFromHtml(item.content) ??

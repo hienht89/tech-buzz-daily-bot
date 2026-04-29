@@ -1,0 +1,143 @@
+Hãy audit và khắc phục TRIỆT ĐỂ toàn bộ bot Telegram trong project này. Không được dừng lại khi mới tìm thấy một nguyên nhân đầu tiên rồi mặc định đó là bug thật. Phải rà soát toàn bộ khả năng có thể gây lỗi, đăng trùng, bỏ lỡ slot đăng, post sai nội dung, post lỗi format HTML, sai cron, sai docs, sai config, drift giữa các implementation, lỗi retry/fallback, lỗi bảo mật ở manual trigger, lỗi dedupe, lỗi storage, lỗi timeout, lỗi quan sát vận hành, và cả các vấn đề tiềm ẩn trong bản backup.
+
+Mục tiêu:
+1) Audit toàn bộ code bot trong:
+- worker/src/index.ts
+- worker/src/ai.ts
+- worker/src/rss.ts
+- worker/src/sources.ts
+- worker/src/storage.ts
+- worker/src/telegram.ts
+- worker/wrangler.toml
+- scripts/src/postNews.ts
+- scripts/src/lib/ai.ts
+- scripts/src/lib/rss.ts
+- scripts/src/lib/sources.ts
+- scripts/src/lib/storage.ts
+- scripts/src/lib/telegram.ts
+- .github/workflows/post-news.yml
+- scripts/BOT_README.md
+- replit.md
+
+2) Không chỉ nêu bug, mà phải TỰ THỰC HIỆN refactor/sửa code cho triệt để.
+
+3) Sau khi sửa, phải đồng bộ code + config + docs + workflow comments + README để không còn chỗ nào mô tả sai hành vi thực tế.
+
+4) Sau khi sửa, phải bổ sung test và self-check để chứng minh hệ thống an toàn hơn trước.
+
+Yêu cầu audit bắt buộc:
+- Không được giả định worker hiện tại là đúng chỉ vì có nhiều hardening hơn scripts.
+- Không được giả định một lỗi đầu tiên là root cause duy nhất.
+- Phải kiểm tra đầy đủ các nhóm sau:
+
+A. Scheduling / deployment
+- Kiểm tra cron ở worker/wrangler.toml có khớp với replit.md, BOT_README.md, workflow comments không
+- Kiểm tra backup GitHub Actions có đang có nguy cơ chạy song song với worker không
+- Nếu cả 2 cùng chạy có thể gây duplicate thì phải sửa chiến lược vận hành
+- Chốt 1 nguồn scheduler chính và backup strategy rõ ràng
+
+B. Duplicate prevention / idempotency / race conditions
+- Kiểm tra logic isPosted + reservePost + unreservePost
+- Đánh giá atomicity thật sự của Cloudflare KV
+- Nếu KV không đảm bảo compare-and-set thì phải thay bằng Durable Object lock, idempotency key, hoặc cơ chế đồng bộ tương đương
+- Chuẩn hóa URL trước khi dedupe: loại bỏ utm params, src=rss, fragment, tracking params
+- Bổ sung dedupe theo normalized title/fingerprint nếu cần
+- Đảm bảo cron + manual trigger hoặc retry network không gây post đôi
+
+C. Candidate selection logic
+- Không được chỉ pick 1 candidate rồi fail là return
+- Phải refactor để trong 1 lần chạy, bot thử nhiều candidate liên tiếp cho đến khi post thành công hoặc hết giới hạn hợp lý
+- Bổ sung logging reason-code cho từng candidate bị skip/fail
+- Nếu một bài fail Gemini hoặc Telegram thì tăng fail count nhưng vẫn tiếp tục thử bài khác trong cùng run
+- Có max-attempt để tránh loop vô hạn
+
+D. RSS robustness
+- Audit parser RSS/Atom hiện tại
+- Xử lý đúng các trường hợp description/content/object/array/entity/HTML
+- Nếu pubDate parse lỗi thì không được mặc định new Date() một cách nguy hiểm làm bài cũ thành bài mới; phải có chiến lược an toàn hơn
+- Phân biệt rõ feed empty, parse fail, network fail
+- Thêm metrics/source health
+- Xem lại bộ lọc tech relevance hiện tại, tránh lọt tin không đúng chủ đề
+
+E. AI summarization
+- Kiểm tra timeout, retry, parse JSON, empty response, incomplete fields
+- Không log lộ nội dung nhạy cảm
+- Thêm validation chặt cho summary output
+- Có fallback strategy nếu model trả text không hợp lệ
+- Nếu cần, thêm support provider fallback nhưng giữ code clean
+- Không throw sớm theo kiểu làm chết toàn bộ run khi còn candidate khác
+
+F. Telegram posting
+- Audit sendPhoto và sendMessage
+- Không được fallback sendMessage một cách mù quáng sau mọi lỗi sendPhoto, vì có thể gây duplicate nếu request bất định
+- Chỉ fallback khi xác định chắc là lỗi ảnh/caption/Bad Request phù hợp
+- Giữ parse_mode HTML an toàn
+- Kiểm tra truncation để không cắt vỡ entity/tag/HTML
+- Đồng bộ logic caption safety giữa worker và scripts
+- Giữ preview/media behavior hợp lý
+
+G. Backup implementation parity
+- So sánh worker và scripts
+- Nếu scripts không còn cần làm backup scheduler thì chuyển nó thành manual/local tool rõ ràng
+- Nếu vẫn giữ backup, phải bring-to-parity ở các phần critical: timeout, truncation, dedupe, retry, observability
+- Xóa drift giữa 2 implementation
+
+H. Security
+- Kiểm tra /run manual trigger
+- Không dùng TELEGRAM_BOT_TOKEN làm trigger token
+- Đồng bộ docs để không còn hướng dẫn cũ kiểu GET /run?token=...
+- Kiểm tra method, auth header, timing-safe compare, status code
+- Không để secret lộ qua log hoặc docs sai
+
+I. Observability / diagnostics
+- Thêm run id, article id/url hash, source stats, candidate counts, failure reasons
+- Log có cấu trúc rõ ràng
+- Tách warning/error types
+- Có health endpoint rõ ràng
+- Có dry-run mode hoặc debug mode
+
+J. Tests
+- Viết tests tối thiểu cho:
+  1. URL normalization
+  2. dedupe / idempotency behavior
+  3. candidate retry loop
+  4. caption truncation không vỡ HTML
+  5. sendPhoto fallback policy
+  6. RSS parsing đa định dạng
+  7. pubDate invalid handling
+  8. manual trigger auth
+- Nếu cần tạo test helpers/mocks thì tự thêm
+
+K. New useful features
+Sau khi fix xong lỗi, hãy bổ sung các tính năng hữu ích nhưng không over-engineer:
+- source health report
+- dry-run mode
+- top candidate preview
+- per-source cooldown hoặc scoring
+- normalized topic/category tagging
+- admin/status endpoint hoặc command nếu phù hợp
+Chỉ thêm các tính năng thực sự giúp bot và kênh Telegram hoàn thiện hơn, không thêm đồ thừa.
+
+Cách làm:
+1. Đọc toàn bộ file liên quan
+2. Liệt kê bug/rủi ro theo severity
+3. Sửa code triệt để
+4. Đồng bộ docs/config
+5. Thêm tests
+6. Chạy typecheck/tests/lint nếu có
+7. Tóm tắt những gì đã sửa, vì sao sửa, rủi ro nào đã được loại bỏ, rủi ro nào còn lại
+
+Output mong muốn:
+- Danh sách bug/rủi ro phát hiện
+- Danh sách file đã sửa
+- Patch/code hoàn chỉnh
+- Test đã thêm
+- Hướng dẫn vận hành sau sửa
+- Những việc khuyến nghị tiếp theo
+
+Ràng buộc:
+- Không được sửa qua loa
+- Không được bỏ sót scripts/ backup path
+- Không được chỉ sửa docs mà bỏ code
+- Không được chỉ sửa code mà bỏ docs/config drift
+- Không được kết luận “done” nếu chưa kiểm tra lại duplicate, retry loop, fallback policy và cron/docs consistency

@@ -13,8 +13,10 @@ function escapeHtmlAttr(text: string): string {
 /**
  * Cắt body RAW (chưa escape) sao cho `escapeHtml(result)` <= budget.
  * Dùng binary search để TRÁNH cắt giữa entity HTML như &amp;.
+ *
+ * Exported chủ yếu cho test (xem worker/test/run-tests.ts).
  */
-function truncateRawByEscapedBudget(raw: string, budget: number): string {
+export function truncateRawByEscapedBudget(raw: string, budget: number): string {
   const escaped = escapeHtml(raw);
   if (escaped.length <= budget) return escaped;
   const ellipsis = "...";
@@ -120,13 +122,15 @@ type TelegramResponse = {
   result?: unknown;
 };
 
-class TelegramError extends Error {
+export class TelegramError extends Error {
   status: number;
   retryAfter?: number;
-  constructor(message: string, status: number, retryAfter?: number) {
+  description?: string;
+  constructor(message: string, status: number, retryAfter?: number, description?: string) {
     super(message);
     this.status = status;
     this.retryAfter = retryAfter;
+    this.description = description;
   }
 }
 
@@ -177,9 +181,56 @@ async function rawCall(
       `Telegram ${method} failed: ${data.description ?? res.statusText}`,
       res.status,
       data.parameters?.retry_after,
+      data.description,
     );
   }
   return data;
+}
+
+/**
+ * Quyết định có an toàn để FALLBACK từ sendPhoto → sendMessage hay không.
+ *
+ * Nguyên tắc: chỉ fallback khi CHẮC CHẮN sendPhoto KHÔNG được nhận thành công
+ * bởi Telegram (tức không có rủi ro post 2 lần).
+ *
+ * AN TOÀN fallback (request bị Telegram từ chối ngay → không có msg nào tới channel):
+ *  - status 400 Bad Request với description liên quan tới ảnh / URL ảnh:
+ *    "wrong file identifier", "WEBPAGE_CURL_FAILED", "PHOTO_INVALID_DIMENSIONS",
+ *    "Image_process_failed", "wrong type of the web page content", "failed to get HTTP URL content",
+ *    "wrong remote file identifier", "wrong remote photo URL".
+ *  - status 400 với description liên quan caption length: "caption is too long".
+ *
+ * KHÔNG an toàn (rủi ro post 2 lần):
+ *  - status 5xx (server error) — sendPhoto có thể đã gửi xong nhưng response lỗi
+ *  - status 408/timeout — không biết Telegram có nhận được hay không
+ *  - status 401/403 — auth fail, fallback cũng fail thôi, không có ích
+ *  - status 429 — đã retry ở rawCall, không nên gửi 2 lần
+ */
+function isSafeToFallbackFromSendPhoto(err: unknown): boolean {
+  if (!(err instanceof TelegramError)) return false;
+  if (err.status !== 400) return false;
+  const desc = (err.description ?? "").toLowerCase();
+  if (!desc) return false;
+  const photoIssuePatterns = [
+    "wrong file identifier",
+    "wrong remote file identifier",
+    "wrong remote photo url",
+    "webpage_curl_failed",
+    "photo_invalid_dimensions",
+    "image_process_failed",
+    "wrong type of the web page content",
+    "failed to get http url content",
+    "wrong url",
+    "wrong url host",
+    "url host is empty",
+    "photo url",
+    "media_invalid",
+    "file is too big",
+    "file_part_invalid",
+    "wrong padding in the string",
+    "caption is too long",
+  ];
+  return photoIssuePatterns.some((p) => desc.includes(p));
 }
 
 function isRetryableTelegramError(err: unknown): boolean {
@@ -222,28 +273,11 @@ async function callApiWithRetry(
 const MAX_CAPTION_LEN = 1024;
 const MAX_MESSAGE_LEN = 4096;
 
-export async function postArticle(
+async function sendTextMessage(
   article: Article,
   summary: Summary,
   env: Env,
 ): Promise<void> {
-  if (article.imageUrl) {
-    const captionForPhoto = formatCaption(article, summary, env, MAX_CAPTION_LEN);
-    try {
-      await callApiWithRetry(env, "sendPhoto", {
-        chat_id: env.TELEGRAM_CHANNEL_ID,
-        photo: article.imageUrl,
-        caption: captionForPhoto,
-        parse_mode: "HTML",
-      });
-      return;
-    } catch (err) {
-      console.warn(
-        `[telegram] sendPhoto failed (${(err as Error).message}), falling back to sendMessage`,
-      );
-    }
-  }
-
   const textForMessage = formatCaption(article, summary, env, MAX_MESSAGE_LEN);
   await callApiWithRetry(env, "sendMessage", {
     chat_id: env.TELEGRAM_CHANNEL_ID,
@@ -256,4 +290,43 @@ export async function postArticle(
       prefer_large_media: true,
     },
   });
+}
+
+export async function postArticle(
+  article: Article,
+  summary: Summary,
+  env: Env,
+): Promise<void> {
+  if (!article.imageUrl) {
+    await sendTextMessage(article, summary, env);
+    return;
+  }
+
+  const captionForPhoto = formatCaption(article, summary, env, MAX_CAPTION_LEN);
+  try {
+    await callApiWithRetry(env, "sendPhoto", {
+      chat_id: env.TELEGRAM_CHANNEL_ID,
+      photo: article.imageUrl,
+      caption: captionForPhoto,
+      parse_mode: "HTML",
+    });
+    return;
+  } catch (err) {
+    // CHỈ fallback nếu Telegram trả 400 với mô tả lỗi liên quan ảnh/caption.
+    // Với 5xx / timeout / network error → KHÔNG fallback (rủi ro post 2 lần).
+    if (isSafeToFallbackFromSendPhoto(err)) {
+      const desc = (err as TelegramError).description ?? (err as Error).message;
+      console.warn(
+        `[telegram] sendPhoto rejected by Telegram (${desc?.slice(0, 200)}). ` +
+          `Safe to fall back to sendMessage (no photo was delivered).`,
+      );
+      await sendTextMessage(article, summary, env);
+      return;
+    }
+    // Không an toàn để fallback → throw để pipeline rollback reservation + đánh fail count.
+    console.error(
+      `[telegram] sendPhoto failed with potentially-delivered status — NOT falling back. Error: ${(err as Error).message}`,
+    );
+    throw err;
+  }
 }
