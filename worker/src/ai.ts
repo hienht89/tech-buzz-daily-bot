@@ -4,17 +4,18 @@ import type { Env } from "./index.js";
 /**
  * Multi-provider AI summarizer với fallback chain.
  *
- * Provider order (try theo thứ tự, fail thì sang cái kế):
- *   1. gemini-2.5-flash      — chất lượng tốt nhất, free tier ~ vài chục req/phút
- *   2. gemini-2.0-flash      — model cũ hơn, có quota RIÊNG → khi 2.5 cạn vẫn chạy
- *   3. openrouter (deepseek) — nhà cung cấp khác hoàn toàn, free tier độc lập
+ * Provider order (Phase 9.2 — key rotation):
+ *   1. gemini-2.5-flash#k0..kN  — primary, mỗi key 1 quota free riêng (xoay vòng)
+ *   2. gemini-2.0-flash#k0..kN  — model cũ hơn, có quota RIÊNG → khi 2.5 cạn vẫn chạy
+ *   3. openrouter llama / gemma — nhà cung cấp KHÁC hoàn toàn (free tier độc lập)
  *
  * Quy tắc bỏ provider:
- *   - HTTP 429 (quota exhausted) → bỏ luôn provider đó cho cả run
+ *   - HTTP 429 (quota exhausted) → bỏ luôn provider#key đó cho cả run
  *   - HTTP 5xx / timeout → retry trong provider 2 lần với backoff, fail → bỏ
  *   - Parse JSON thất bại 2 lần → bỏ provider, sang provider kế
  *
- * Trả về `{ summary, provider }` để caller log model nào đã được dùng.
+ * Trả về `{ summary, provider }` để caller log model + key index nào đã được dùng
+ * (vd `gemini-2.5-flash#k1`).
  *
  * Backward compat schema cũ { title, body, takeaway } vẫn parse được.
  */

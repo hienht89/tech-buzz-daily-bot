@@ -70,7 +70,11 @@ export interface Env {
 // Constants
 // ────────────────────────────────────────────────────────────────────────────
 
-const MAX_AGE_HOURS = 48;
+// Phase 14: siết từ 48h → 30h. Channel daily news không cần bài >1 ngày tuổi;
+// 30h cho slack qua múi giờ (bài Mỹ chiều → kịp post sáng VN ngày sau).
+// Recency decay window trong score.ts vẫn 48h — bài 30h vẫn còn ~37/100 điểm
+// recency, không bị 0, đủ để tie-break.
+const MAX_AGE_HOURS = 30;
 
 /**
  * Số lượng candidate tối đa thử trong 1 lần chạy.
@@ -638,8 +642,54 @@ export default {
       });
     }
 
+    // ───── /top_today: top 10 candidate eligible NGAY BÂY GIỜ (cần auth) ─────
+    // Phase 13: dùng để debug "vì sao bài X không được chọn?" — chạy full pipeline
+    // (fetch + filter + score + dedup) nhưng KHÔNG post, trả về top 10 bài score
+    // cao nhất cùng breakdown chi tiết để diagnostic.
+    if (url.pathname === "/top_today") {
+      if (!isAuthorized(req, env)) {
+        return new Response("Unauthorized\n", { status: 401 });
+      }
+      const runId = shortRunId();
+      try {
+        const pick = await pickCandidates(env, runId);
+        const now = new Date();
+        const top = pick.candidates.slice(0, 10).map((a) => ({
+          title: a.title,
+          source: a.source,
+          category: a.sourceCategory,
+          priority: a.sourcePriority,
+          link: a.link,
+          pubDate: a.pubDate.toISOString(),
+          score: a.score,
+          breakdown: scoreArticle(a, now),
+        }));
+        const body = {
+          runId,
+          totalFetched: pick.totalFetched,
+          freshCount: pick.freshCount,
+          techCount: pick.techCount,
+          scoredCount: pick.scoredCount,
+          clusteredCount: pick.clusteredCount,
+          eligibleCount: pick.candidates.length,
+          top,
+          checkedAt: new Date().toISOString(),
+        };
+        return new Response(JSON.stringify(body, null, 2), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      } catch (err) {
+        return new Response(
+          JSON.stringify({ error: (err as Error).message }, null, 2),
+          { status: 500, headers: { "Content-Type": "application/json" } },
+        );
+      }
+    }
+
     // ───── /run: manual trigger (cần auth) ─────
-    if (url.pathname === "/run") {
+    // Alias /force_fetch (Phase 13) — cùng logic, tên khác cho admin tiện gọi.
+    if (url.pathname === "/run" || url.pathname === "/force_fetch") {
       if (req.method !== "POST") {
         return new Response("Method Not Allowed. Use POST.\n", {
           status: 405,
@@ -688,13 +738,15 @@ export default {
 
     return new Response(
       "Tech Buzz Daily bot worker.\n" +
-        "Endpoints:\n" +
-        "  GET  /health                 — ping\n" +
-        "  POST /run (Bearer)           — trigger ngay (async)\n" +
-        "  POST /run?dry=1 (Bearer)     — dry-run, trả về candidate sẽ chọn (KHÔNG post)\n" +
-        "  GET  /sources (Bearer)       — source health report\n" +
-        "  GET  /stats   (Bearer)       — bucket usage hôm nay + recent titles\n" +
-        "  GET  /last    (Bearer)       — snapshot bài đăng gần nhất\n",
+        "Endpoints (Bearer = cần Authorization: Bearer <RUN_TRIGGER_TOKEN>):\n" +
+        "  GET  /health                  — ping\n" +
+        "  POST /run (Bearer)            — trigger ngay (async)\n" +
+        "  POST /run?dry=1 (Bearer)      — dry-run, trả về candidate sẽ chọn (KHÔNG post)\n" +
+        "  POST /force_fetch (Bearer)    — alias của /run\n" +
+        "  GET  /sources   (Bearer)      — source health report\n" +
+        "  GET  /stats     (Bearer)      — bucket usage hôm nay + recent titles\n" +
+        "  GET  /last      (Bearer)      — snapshot bài đăng gần nhất\n" +
+        "  GET  /top_today (Bearer)      — top 10 candidate eligible + score breakdown\n",
       { status: 200, headers: { "Content-Type": "text/plain" } },
     );
   },

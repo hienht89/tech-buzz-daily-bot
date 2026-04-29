@@ -37,7 +37,7 @@ Deployed to Cloudflare Workers. Migrated từ GitHub Actions vì GH Actions cron
 
 - **Entry point**: `worker/src/index.ts` (exports `scheduled` + `fetch` handlers)
 - **Modules**: `worker/src/{rss,ai,telegram,storage,sources,url,filter,score,dedup,bucket}.ts`
-- **Tests**: `worker/test/run-tests.ts` — 60 unit tests (URL norm, HTML truncation, og:image, filter, score, dedup, bucket, telegram caption, ai parsing)
+- **Tests**: `worker/test/run-tests.ts` — 77 unit tests (URL norm, HTML truncation, og:image, filter, score, dedup, bucket, telegram caption, ai parsing, AI key rotation, per-domain trust)
 - **Config**: `worker/wrangler.toml` — cron `0 0-17 * * *` UTC (= mỗi giờ 7h-0h VN, 18 lần/ngày)
 - **Storage**: Cloudflare KV namespace `POSTED_KV`
   - `posted:<sha1(canonical_url)>` — TTL 30 ngày, ngăn dupe URL
@@ -46,8 +46,17 @@ Deployed to Cloudflare Workers. Migrated từ GitHub Actions vì GH Actions cron
   - `quota:YYYY-MM-DD:<category>` — đếm bài đã post mỗi bucket trong ngày
   - `last_posted_v1` — metadata bài cuối + run history (10 entry gần nhất)
   - `failed:<sha1(canonical_url)>` — fail counter, sau 3 lần fail liên tục → poison 24h
-- **RSS sources**: 18 nguồn curated (xem `worker/src/sources.ts`) — chia 5 category (`core`, `ai`, `dev`, `research`, `trend`) với priority 1-3
-- **Pipeline mới (Phase 1-7 upgrade)**:
+- **RSS sources**: **21 nguồn** curated (xem `worker/src/sources.ts`) — chia 5 category (`core`, `ai`, `dev`, `research`, `trend`) với priority 1-3. Phase 10: bỏ Anthropic News + Meta AI Blog (dead 404) + Papers with Code (parser fail), thêm Stripe / Cloudflare / Vercel / AWS / Simon Willison / Latent Space.
+- **Endpoints debug** (`Authorization: Bearer <RUN_TRIGGER_TOKEN>`):
+  - `GET /health`, `GET /sources`, `GET /stats`, `GET /last`
+  - `GET /top_today` — top 10 candidate eligible + score breakdown chi tiết (Phase 13)
+  - `POST /run` (alias `POST /force_fetch`) — manual trigger
+  - `POST /run?dry=1` — dry run (chọn nhưng không post)
+- **Phase 10/11/13/14 (Apr 2026)**:
+  - Source health: 21/21 nguồn alive (trước: 14/18). FETCH_TIMEOUT 12s → 18s. MAX_AGE 48h → 30h.
+  - Per-domain trust score (`score.ts`): `DOMAIN_TRUST_TABLE` (37 domain, +5..+25 boost) + `BLOCKED_DOMAINS` (19 domain SEO farm, penalty −1000). Suffix match (`news.openai.com` ≈ `openai.com`).
+  - `NON_TECH_TITLE_KEYWORDS` mở rộng 11 → 32 từ (chính trị + showbiz + thể thao + lifestyle).
+- **Pipeline (Phase 1-7 upgrade)**:
   1. Fetch song song 18 nguồn → strict filter cho arxiv (chỉ paper LLM/AI)
   2. Score article: `sourceWeight + recency + keyword(boost-penalty) + primaryLab + engineering + depth − hnPenalty`
   3. Cluster intra-batch (jaccard ≥ 0.80) — winner = source priority thấp hơn

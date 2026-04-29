@@ -207,8 +207,11 @@ function getContentSnippet(item: AnyObj): string {
     .trim();
 }
 
-// Timeout per source — tránh 1 nguồn slow block toàn bộ Promise.all
-const FETCH_TIMEOUT_MS = 12_000;
+// Timeout per source — tránh 1 nguồn slow block toàn bộ Promise.all.
+// 18s vì hnrss.org và arXiv thường mất 12-15s ở giờ cao điểm; sub-request limit
+// của Cloudflare Workers là 30s nên 18s vẫn an toàn (parallel nên wall time =
+// max single source, không cộng dồn).
+const FETCH_TIMEOUT_MS = 18_000;
 
 // Giới hạn số bài lấy từ MỖI nguồn (lấy bài mới nhất sau khi parse).
 // Giảm CPU dành cho parse + sort + filter trên free plan của Cloudflare.

@@ -333,7 +333,71 @@ test("score.formatBreakdown trả string có total", () => {
   const now = new Date();
   const r = scoreArticle(mkArticle({ pubDate: now }), now);
   const s = formatBreakdown(r);
-  assert.match(s, /→ \d+/);
+  assert.match(s, /→ -?\d+/);
+});
+
+// Phase 11: per-domain trust
+test("score: domain trust boost cho openai.com (suffix match)", () => {
+  const now = new Date();
+  const fixed = new Date(now.getTime() - 3600 * 1000);
+  const r = scoreArticle(
+    mkArticle({
+      link: "https://news.openai.com/post/abc",
+      canonicalUrl: "https://news.openai.com/post/abc",
+      source: "OpenAI Blog", // primaryLab cũng cộng — verify cả 2 stack được
+      sourcePriority: 1,
+      pubDate: fixed,
+    }),
+    now,
+  );
+  assert.ok(r.domainTrust > 0, "domain openai.com phải có trust > 0");
+  assert.equal(r.domainBlock, 0, "openai.com không bị block");
+});
+
+test("score: blocked domain bị penalty rất lớn → total âm", () => {
+  const now = new Date();
+  const fixed = new Date(now.getTime() - 3600 * 1000);
+  const r = scoreArticle(
+    mkArticle({
+      link: "https://www.androidauthority.com/some-article",
+      canonicalUrl: "https://www.androidauthority.com/some-article",
+      source: "TechCrunch", // không phải lab nhưng vẫn priority 2
+      sourcePriority: 2,
+      pubDate: fixed,
+    }),
+    now,
+  );
+  assert.ok(r.domainBlock > 0, "androidauthority.com phải bị block");
+  assert.ok(r.total < 0, "total phải âm sau penalty (đảm bảo không bao giờ pick)");
+});
+
+test("score: domain không nằm trong table → trust = 0, không crash", () => {
+  const now = new Date();
+  const fixed = new Date(now.getTime() - 3600 * 1000);
+  const r = scoreArticle(
+    mkArticle({
+      link: "https://random-blog-xyz.com/post",
+      canonicalUrl: "https://random-blog-xyz.com/post",
+      pubDate: fixed,
+    }),
+    now,
+  );
+  assert.equal(r.domainTrust, 0);
+  assert.equal(r.domainBlock, 0);
+});
+
+test("score: URL không parse được → domain rỗng, không crash", () => {
+  const now = new Date();
+  const r = scoreArticle(
+    mkArticle({
+      link: "not-a-valid-url",
+      canonicalUrl: "not-a-valid-url",
+      pubDate: now,
+    }),
+    now,
+  );
+  assert.equal(r.domainTrust, 0);
+  assert.equal(r.domainBlock, 0);
 });
 
 // ────────────────────────────────────────────────────────────────────────────
