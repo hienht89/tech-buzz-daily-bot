@@ -1,0 +1,332 @@
+Bạn hãy đóng vai **Senior QA Engineer + SRE + Backend Reviewer**.
+Nhiệm vụ lần này là **TEST và ĐÁNH GIÁ toàn bộ bot Telegram curated news hiện tại**, **KHÔNG sửa code**, **KHÔNG refactor**, **KHÔNG thay đổi logic**, trừ khi tôi yêu cầu ở bước tiếp theo.
+
+## Mục tiêu
+
+Tôi vừa hoàn tất một đợt nâng cấp bot theo hướng:
+
+* fix nguồn RSS lỗi
+* thêm domain trust score
+* thêm blocked domains
+* thêm endpoint `/top_today`, `/force_fetch`
+* siết freshness
+* cải thiện scoring đầu vào
+
+Bây giờ tôi muốn bạn **test toàn diện** để xác minh:
+
+1. bot có hoạt động ổn định không
+2. bài được chọn có thật sự hay hơn chưa
+3. còn lỗi duplicate / spam / chọn bài nhạt không
+4. endpoint debug có hữu ích không
+5. hệ thống hiện tại đã đủ tốt để chạy tiếp chưa
+6. có cần phase tiếp theo hay chỉ cần fine-tune
+
+---
+
+## Quy tắc làm việc
+
+* **Chỉ test và báo cáo**
+* **Không sửa code**
+* **Không tự ý refactor**
+* **Không thêm feature**
+* **Không deploy thay đổi**
+* Nếu cần thay đổi gì, chỉ được **đề xuất** ở cuối báo cáo
+
+---
+
+## Phạm vi test
+
+Hãy test toàn bộ những phần sau:
+
+### A. Smoke test hệ thống
+
+Kiểm tra:
+
+* bot có start được không
+* scheduler / cron flow có ổn không
+* fetch pipeline có chạy hết không
+* không crash khi một feed lỗi
+* health endpoint hoạt động
+* command admin hoạt động
+
+### B. RSS source health
+
+Kiểm tra toàn bộ nguồn hiện tại:
+
+* nguồn nào alive
+* nguồn nào timeout
+* nguồn nào parse lỗi
+* nguồn nào trả dữ liệu rỗng
+* nguồn nào hay sinh bài kém chất lượng
+
+Yêu cầu thống kê:
+
+* số nguồn tổng
+* số nguồn healthy
+* số nguồn degraded
+* số nguồn fail
+* thời gian phản hồi tương đối
+* nguồn nào đáng giữ / đáng bỏ / đáng giảm trust
+
+### C. End-to-end fetch → filter → score → dedup → select → summarize → publish
+
+Dùng dry run hoặc chế độ an toàn trước nếu có thể.
+
+Kiểm tra:
+
+* bài nào được fetch
+* bài nào bị loại
+* lý do bị loại
+* bài nào được chấm điểm cao nhất
+* bài nào được chọn cuối cùng
+* định dạng Telegram cuối cùng có ổn không
+
+### D. Test endpoint debug/admin
+
+Kiểm tra tối thiểu:
+
+* `/health`
+* `/stats`
+* `/sources`
+* `/last`
+* `/top_today`
+* `/force_fetch`
+* nếu có dry mode thì test cả dry mode
+
+Với mỗi endpoint:
+
+* xác nhận hoạt động hay không
+* output có hữu ích hay không
+* có lỗi format / timeout / thiếu dữ liệu không
+
+### E. Chất lượng bài viết được chọn
+
+Đây là phần quan trọng nhất.
+
+Hãy đánh giá output như một biên tập viên nội dung, không chỉ như kỹ sư.
+
+Tôi muốn bạn xem các bài được chọn và trả lời:
+
+* bài top có thực sự đáng đọc không
+* có bài nào score cao nhưng nội dung nhạt / clickbait / không đáng đăng không
+* có bài nào bị bỏ sót dù đáng lẽ nên được chọn không
+* có nguồn nào đang được ưu tiên quá mức không
+* có category nào đang yếu / thiếu / lệch không
+
+### F. Dedup / anti-spam
+
+Hãy chạy kiểm tra lặp lại nhiều lần nếu có thể:
+
+* gọi dry run nhiều lần liên tiếp
+* quan sát có bài trùng không
+* có cùng một sự kiện xuất hiện từ nhiều nguồn khác nhau không
+* có khả năng post trùng giữa 2 run sát nhau không
+* reserve / claim / KV dedup hiện tại có đủ mạnh chưa
+
+### G. Scoring audit
+
+Dùng `/top_today` hoặc cách tương đương để audit:
+
+* score breakdown của top bài
+* domain trust đang tác động ra sao
+* keyword boost/penalty có hợp lý không
+* có domain nào thắng quá nhiều không
+* có bài rác nào được boost nhầm không
+
+### H. Content quality audit (rất quan trọng)
+
+Đánh giá:
+
+* tiêu đề tiếng Việt có tự nhiên không
+* tóm tắt có gọn, rõ, đáng đọc không
+* có bị dịch máy cứng không
+* có bài nào lên kênh nhưng đọc xong không thấy giá trị không
+* nếu là người dùng thật, bạn có muốn theo dõi kênh mỗi ngày không
+
+### I. Stress / resilience
+
+Nếu có thể, kiểm tra thêm:
+
+* nhiều nguồn chậm cùng lúc
+* một vài nguồn fail
+* AI provider fail / fallback
+* Telegram sendPhoto fail fallback sendMessage
+* manual trigger liên tiếp
+* timeout dài
+
+Mục tiêu:
+
+* xác nhận hệ thống degrade gracefully
+* không sập dây chuyền
+
+---
+
+## Kịch bản test cụ thể cần chạy
+
+### 1. Smoke test
+
+* start service
+* kiểm tra log khởi động
+* gọi `/health`
+
+### 2. Source test
+
+* liệt kê toàn bộ nguồn
+* thử fetch tất cả
+* thống kê nguồn sống/chết/chậm
+
+### 3. Dry run test
+
+* gọi `/force_fetch?dry=1` nếu hỗ trợ
+* ghi lại top bài được chọn
+* ghi lại lý do chọn
+
+### 4. Top ranking audit
+
+* gọi `/top_today`
+* lấy top 10 bài
+* phân tích từng bài: vì sao thắng, có xứng đáng không
+
+### 5. Repeatability / dedup test
+
+* chạy dry run 2–3 lần liên tiếp
+* so sánh output giữa các run
+* phát hiện bài lặp / event overlap / race condition
+
+### 6. Real publish safety check
+
+* nếu có môi trường an toàn thì kiểm tra publish path
+* nếu không an toàn thì chỉ simulate đến ngay trước bước publish
+
+### 7. Content/editorial review
+
+* chọn 5–10 bài đầu ra
+* chấm điểm từng bài theo góc nhìn biên tập:
+
+  * đáng đọc
+  * bình thường
+  * nên loại
+
+---
+
+## Tiêu chí pass/fail
+
+### PASS nếu:
+
+* hầu hết nguồn hoạt động ổn
+* không có crash nghiêm trọng
+* dry run ổn định
+* top bài nhìn hợp lý
+* không có duplicate rõ ràng
+* format Telegram tốt
+* summary tiếng Việt ổn
+* đa số bài thật sự đáng đọc
+
+### FAIL hoặc NEEDS TUNING nếu:
+
+* còn bài nhạt lọt top
+* còn trùng sự kiện
+* nguồn yếu vẫn được ưu tiên
+* bài hay bị bỏ sót
+* domain trust chưa hợp lý
+* scoring có dấu hiệu lệch
+* category quota chưa hợp lý
+* output tiếng Việt còn cứng
+
+---
+
+## Output báo cáo bắt buộc
+
+Sau khi test xong, hãy trả về một báo cáo có cấu trúc rõ ràng với các phần sau:
+
+### 1. Executive summary
+
+* bot hiện tại ở mức nào
+* đã đủ tốt để chạy tiếp chưa
+* có cần sửa gấp gì không
+
+### 2. Test coverage
+
+* bạn đã test những gì
+* test nào chạy được
+* test nào không chạy được và vì sao
+
+### 3. Source health report
+
+* bảng nguồn healthy / degraded / failed
+* nhận xét nguồn nào tốt, nguồn nào nên giảm vai trò
+
+### 4. Pipeline quality report
+
+* fetch
+* filter
+* score
+* dedup
+* select
+* summarize
+* publish
+
+### 5. Endpoint report
+
+* endpoint nào hoạt động tốt
+* endpoint nào cần cải thiện
+
+### 6. Editorial quality report
+
+* top bài có hay không
+* bài nào nên loại
+* bài nào nên giữ
+* nguồn nào đang thống trị quá mức
+
+### 7. Dedup / anti-spam report
+
+* có hiện tượng trùng hay không
+* mức độ nghiêm trọng
+
+### 8. Risk assessment
+
+Phân loại:
+
+* Critical
+* High
+* Medium
+* Low
+
+### 9. Fine-tuning recommendations
+
+Chỉ đề xuất, không sửa:
+
+* domain trust cần tăng/giảm cho nguồn nào
+* blocked domains nên thêm/bớt gì
+* keyword boost/penalty nên chỉnh gì
+* quota category nên đổi ra sao
+* daily volume có nên giảm không
+
+### 10. Kết luận cuối
+
+Phải kết luận rõ một trong 3 trạng thái:
+
+* READY TO RUN
+* RUN BUT NEEDS TUNING
+* NOT READY
+
+---
+
+## Cách làm việc mong muốn
+
+* Ưu tiên test bằng dữ liệu thật
+* Ưu tiên dry-run trước
+* Nếu có log, hãy dùng log để chứng minh nhận định
+* Không kết luận cảm tính nếu chưa có bằng chứng
+* Nếu không chắc, hãy ghi rõ mức độ chắc chắn
+* Nếu phát hiện bug, chỉ ghi lại, chưa sửa
+
+Bắt đầu ngay bằng:
+
+1. xác định cách chạy bot và các endpoint hiện có
+2. chạy smoke test
+3. chạy source health test
+4. chạy dry-run
+5. audit `/top_today`
+6. chạy repeat test cho dedup
+7. xuất báo cáo cuối cùng
