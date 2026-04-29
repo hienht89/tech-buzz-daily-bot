@@ -1,0 +1,175 @@
+Bạn tiếp tục đóng vai **Senior SRE + Production Debugger**.
+
+Nhiệm vụ lần này: **điều tra production issue CRITICAL** đã phát hiện trong báo cáo QA, cụ thể là:
+
+* `/stats` cho thấy `0/18 posts today`
+* `/last` trả `KV empty`
+* `recentTitlesCount: 0`
+* hiện tại đã là khoảng giữa ngày theo giờ Việt Nam, nên đáng lẽ cron đã chạy nhiều lần
+* cần xác minh cron có thực sự fire không, có đi vào pipeline không, có fail ở bước nào không, có ghi KV không
+
+## Mục tiêu
+
+Chỉ **điều tra, test, đọc log, đối chiếu flow, và báo cáo nguyên nhân gốc**.
+
+## Quy tắc
+
+* **KHÔNG sửa code**
+* **KHÔNG deploy**
+* **KHÔNG thay đổi config**
+* chỉ được:
+
+  * tail log
+  * gọi endpoint
+  * đối chiếu pipeline
+  * xác định root cause
+  * đề xuất hướng sửa ở cuối
+
+---
+
+## Giả thuyết cần xác minh
+
+Hãy kiểm tra lần lượt các khả năng sau, không được dừng ở giả thuyết đầu tiên:
+
+1. cron không fire
+2. cron fire nhưng route/schedule không vào đúng handler
+3. cron fire nhưng fail sớm ở fetch/filter/score
+4. cron đi hết pipeline nhưng fail ở AI summarize
+5. cron đi hết summarize nhưng fail ở Telegram publish
+6. publish thành công nhưng fail ở bước ghi KV (`setLastPosted`, `pushRecentTitle`, `incrementCategoryUsage`, reserve/unreserve)
+7. KV namespace production đang sai binding, sai environment, hoặc bị reset/wipe
+8. manual endpoint và cron đang dùng khác environment / khác KV namespace
+9. có race condition hoặc early return khiến không write state
+10. log/reporting endpoint đọc từ key khác với key write
+
+---
+
+## Phạm vi điều tra bắt buộc
+
+### A. Cron execution verification
+
+* xác minh schedule production hiện tại
+* xác minh cron có thực sự fire trong production không
+* lấy bằng chứng từ log gần nhất
+* liệt kê các tick cron trong vài giờ gần đây nếu có thể
+
+### B. Pipeline tracing
+
+Từ log production, lần theo path:
+
+* cron start
+* fetch start/end
+* filter result
+* candidate count
+* AI summarize start/end
+* Telegram send start/end
+* KV write start/end
+* error/exception nếu có
+
+### C. KV state verification
+
+Kiểm tra:
+
+* các key chính có tồn tại không
+* key nào đang rỗng
+* key nào đáng lẽ phải được cập nhật nhưng chưa cập nhật
+* manual run và cron run có dùng cùng namespace không
+
+### D. Endpoint vs production consistency
+
+Đối chiếu:
+
+* `/stats`
+* `/last`
+* `/top_today`
+* `/run?dry=1`
+* nếu có `/force_fetch`
+
+Mục tiêu:
+
+* xác định endpoint debug đang phản ánh đúng production state hay không
+
+### E. Publish path verification
+
+Không cần đăng thật nếu rủi ro cao, nhưng phải xác định:
+
+* cron có đi tới bước publish attempt không
+* nếu có, fail ở sendPhoto, sendMessage, hay trước đó
+* nếu publish fail thì rollback state có hoạt động không
+
+### F. Root cause analysis
+
+Bạn phải kết luận theo 1 trong các dạng sau:
+
+* root cause đã xác định rõ
+* có 2–3 nguyên nhân khả dĩ, kèm xác suất
+* chưa đủ bằng chứng, cần thêm bước gì
+
+---
+
+## Các bước thực hiện đề xuất
+
+1. tail production logs quanh các mốc cron gần nhất
+2. gọi lại các endpoint debug để chụp snapshot hiện tại
+3. đối chiếu flow expected vs actual
+4. xác định chính xác “đứt” ở bước nào
+5. tổng hợp root cause
+
+---
+
+## Output báo cáo bắt buộc
+
+### 1. Executive summary
+
+* cron có chạy không
+* pipeline dừng ở đâu
+* KV có được ghi không
+* mức độ nghiêm trọng
+
+### 2. Evidence log timeline
+
+* timeline các event quan trọng từ log
+* mốc thời gian UTC và giờ Việt Nam
+
+### 3. State consistency report
+
+* endpoint nào phản ánh đúng
+* endpoint nào có thể gây hiểu nhầm
+* KV state hiện ra sao
+
+### 4. Root cause
+
+* nguyên nhân gốc rõ nhất
+* các nguyên nhân phụ nếu có
+
+### 5. Confidence level
+
+* cao / vừa / thấp
+* vì sao
+
+### 6. Recommended fix plan
+
+Chỉ đề xuất, chưa sửa:
+
+* sửa gì trước
+* file nào có khả năng liên quan
+* mức effort và rủi ro
+
+---
+
+## Tiêu chí hoàn thành
+
+Tôi không cần bạn sửa ngay.
+Tôi cần bạn trả lời được thật rõ:
+
+1. Cron production có fire hay không?
+2. Nếu có, nó fail ở chính xác bước nào?
+3. Vì sao `/stats` và `/last` đang trống?
+4. Đây là bug logic, bug hạ tầng, bug config, hay chỉ là false alarm?
+
+Bắt đầu ngay bằng:
+
+* tail log production
+* chụp snapshot endpoint hiện tại
+* dựng timeline cron gần nhất
+* rồi viết báo cáo RCA hoàn chỉnh
