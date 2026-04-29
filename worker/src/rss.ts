@@ -188,9 +188,19 @@ function getContentSnippet(item: AnyObj): string {
     .trim();
 }
 
+// Timeout per source — tránh 1 nguồn slow block toàn bộ Promise.all
+const FETCH_TIMEOUT_MS = 12_000;
+
+// Giới hạn số bài lấy từ MỖI nguồn (lấy bài mới nhất sau khi parse).
+// Giảm CPU dành cho parse + sort + filter trên free plan của Cloudflare.
+const MAX_ITEMS_PER_SOURCE = 25;
+
 export async function fetchSource(source: RssSource): Promise<Article[]> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
   try {
     const res = await fetch(source.url, {
+      signal: controller.signal,
       headers: {
         "User-Agent":
           "Mozilla/5.0 (compatible; TechBuzzBot/1.0; +https://t.me/techbuzz_daily)",
@@ -218,8 +228,16 @@ export async function fetchSource(source: RssSource): Promise<Article[]> {
     else if ((data.channel as AnyObj | undefined)?.item)
       items = (data.channel as AnyObj).item as AnyObj[];
 
+    if (items.length === 0) {
+      console.warn(`[rss] ${source.name}: 0 items parsed (feed format unrecognized?)`);
+      return [];
+    }
+
+    // Lấy tối đa MAX_ITEMS_PER_SOURCE bài đầu tiên (RSS thường sort newest-first)
+    const limited = items.slice(0, MAX_ITEMS_PER_SOURCE);
+
     const articles: Article[] = [];
-    for (const item of items) {
+    for (const item of limited) {
       const link = getLink(item);
       const title = strOrEmpty(item.title);
       if (!link || !title) continue;
@@ -234,16 +252,35 @@ export async function fetchSource(source: RssSource): Promise<Article[]> {
     }
     return articles;
   } catch (err) {
-    console.error(
-      `[rss] Failed to fetch ${source.name}: ${(err as Error).message}`,
-    );
+    const msg = (err as Error).message ?? String(err);
+    const reason = (err as Error).name === "AbortError"
+      ? `timeout after ${FETCH_TIMEOUT_MS}ms`
+      : msg;
+    console.error(`[rss] Failed to fetch ${source.name}: ${reason}`);
     return [];
+  } finally {
+    clearTimeout(timeoutId);
   }
 }
 
+// Sau khi sort, chỉ giữ top N để giảm CPU cho filter + KV lookup.
+const TOP_ARTICLES_AFTER_SORT = 200;
+
 export async function fetchAllSources(sources: RssSource[]): Promise<Article[]> {
   const results = await Promise.all(sources.map(fetchSource));
+
+  // Log per-source counts để dễ debug khi không có bài
+  const stats = sources
+    .map((s, i) => `${s.name}=${results[i].length}`)
+    .join(" ");
+  console.log(`[rss] Fetched per-source: ${stats}`);
+
+  const failedCount = results.filter((r) => r.length === 0).length;
+  if (failedCount > 0) {
+    console.warn(`[rss] ${failedCount}/${sources.length} sources returned 0 articles`);
+  }
+
   const articles = results.flat();
   articles.sort((a, b) => b.pubDate.getTime() - a.pubDate.getTime());
-  return articles;
+  return articles.slice(0, TOP_ARTICLES_AFTER_SORT);
 }

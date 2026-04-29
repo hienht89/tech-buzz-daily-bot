@@ -50,6 +50,8 @@ function sleep(ms: number): Promise<void> {
 
 type GeminiHttpError = Error & { status?: number };
 
+const GEMINI_TIMEOUT_MS = 20_000;
+
 async function callGemini(article: Article, apiKey: string): Promise<string> {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${apiKey}`;
   const reqBody = {
@@ -64,11 +66,14 @@ async function callGemini(article: Article, apiKey: string): Promise<string> {
   const maxRetries = 4;
   let lastErr: unknown;
   for (let attempt = 0; attempt < maxRetries; attempt++) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
     try {
       const res = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(reqBody),
+        signal: controller.signal,
       });
       if (!res.ok) {
         const errText = await res.text().catch(() => "");
@@ -86,9 +91,16 @@ async function callGemini(article: Article, apiKey: string): Promise<string> {
       return text;
     } catch (err) {
       lastErr = err;
-      const status = (err as GeminiHttpError).status;
-      const msg = (err as Error).message?.toLowerCase() ?? "";
+      const isAbort = (err as Error).name === "AbortError";
+      if (isAbort) {
+        const wrapped = new Error(`Gemini timeout after ${GEMINI_TIMEOUT_MS}ms`) as GeminiHttpError;
+        wrapped.status = 408;
+        lastErr = wrapped;
+      }
+      const status = (lastErr as GeminiHttpError).status;
+      const msg = (lastErr as Error).message?.toLowerCase() ?? "";
       const retryable =
+        isAbort ||
         status === 429 ||
         status === 500 ||
         status === 502 ||
@@ -98,12 +110,14 @@ async function callGemini(article: Article, apiKey: string): Promise<string> {
         msg.includes("overloaded") ||
         msg.includes("rate") ||
         msg.includes("fetch");
-      if (!retryable || attempt === maxRetries - 1) throw err;
+      if (!retryable || attempt === maxRetries - 1) throw lastErr;
       const backoffMs = 2000 * Math.pow(2, attempt);
       console.warn(
-        `[ai] Gemini retry ${attempt + 1}/${maxRetries} in ${backoffMs}ms: ${(err as Error).message?.slice(0, 200)}`,
+        `[ai] Gemini retry ${attempt + 1}/${maxRetries} in ${backoffMs}ms: ${(lastErr as Error).message?.slice(0, 200)}`,
       );
       await sleep(backoffMs);
+    } finally {
+      clearTimeout(timeoutId);
     }
   }
   throw lastErr;

@@ -6,7 +6,15 @@ import {
 import { fetchAllSources, type Article } from "./rss.js";
 import { summarizeArticle } from "./ai.js";
 import { postArticle } from "./telegram.js";
-import { isPosted, reservePost, unreservePost } from "./storage.js";
+import {
+  isPosted,
+  reservePost,
+  unreservePost,
+  getFailCount,
+  incrementFailCount,
+  clearFailCount,
+  MAX_FAIL_BEFORE_SKIP,
+} from "./storage.js";
 
 export interface Env {
   POSTED_KV: KVNamespace;
@@ -32,18 +40,53 @@ function isFresh(article: Article): boolean {
 async function pickArticle(env: Env): Promise<Article | null> {
   console.log(`[bot] Fetching ${RSS_SOURCES.length} RSS sources...`);
   const allArticles = await fetchAllSources(RSS_SOURCES);
-  console.log(`[bot] Fetched ${allArticles.length} total articles`);
+  console.log(`[bot] Fetched ${allArticles.length} total articles (top-N after sort)`);
 
-  // Lọc sơ bộ: tươi + tech-relevant
-  const candidates = allArticles.filter(
-    (a) => isFresh(a) && isTechRelevantUrl(a.link) && isTechRelevantTitle(a.title),
+  // Lọc tách bước để log từng giai đoạn — biết bài nào bị loại vì lý do gì.
+  const fresh = allArticles.filter(isFresh);
+  const techUrl = fresh.filter((a) => isTechRelevantUrl(a.link));
+  const candidates = techUrl.filter((a) => isTechRelevantTitle(a.title));
+  console.log(
+    `[bot] Filter pipeline: total=${allArticles.length} fresh=${fresh.length} ` +
+      `tech-url=${techUrl.length} tech-title=${candidates.length}`,
   );
-  console.log(`[bot] ${candidates.length} fresh tech-relevant candidates`);
 
-  // Đi từ bài mới nhất xuống, lấy bài đầu tiên CHƯA đăng (1 KV read mỗi bài, dừng sớm)
-  for (const a of candidates) {
-    if (!(await isPosted(env, a.link))) return a;
+  if (candidates.length === 0) {
+    console.warn(
+      "[bot] No candidates after filtering. Có thể: (1) tất cả nguồn RSS fail, " +
+        "(2) tin quá cũ (>48h), (3) filter từ khóa quá chặt.",
+    );
+    return null;
   }
+
+  // Đi từ bài mới nhất xuống, bỏ qua: (a) đã đăng, (b) poison (fail >= MAX).
+  let checked = 0;
+  let skippedPosted = 0;
+  let skippedPoison = 0;
+  for (const a of candidates) {
+    checked++;
+    if (await isPosted(env, a.link)) {
+      skippedPosted++;
+      continue;
+    }
+    const failCount = await getFailCount(env, a.link);
+    if (failCount >= MAX_FAIL_BEFORE_SKIP) {
+      skippedPoison++;
+      console.warn(
+        `[bot] Skipping poison article (fail=${failCount}): "${a.title.slice(0, 80)}"`,
+      );
+      continue;
+    }
+    console.log(
+      `[bot] Picked after checking ${checked}/${candidates.length} ` +
+        `(skipped: ${skippedPosted} posted, ${skippedPoison} poison)`,
+    );
+    return a;
+  }
+  console.warn(
+    `[bot] No usable article in ${candidates.length} candidates ` +
+      `(${skippedPosted} đã đăng, ${skippedPoison} poison). Đợi cron tiếp.`,
+  );
   return null;
 }
 
@@ -57,24 +100,43 @@ async function runBot(env: Env): Promise<void> {
   console.log(`[bot] Selected: "${article.title}" (${article.source})`);
   console.log(`[bot]   Link: ${article.link}`);
 
-  console.log("[bot] Generating Vietnamese summary with Gemini...");
-  const summary = await summarizeArticle(article, env);
-  console.log(`[bot]   Title: ${summary.title}`);
+  // ────────── Bước 1: Gemini summarize ──────────
+  // Nếu fail → tăng fail count nhưng KHÔNG throw để cron tiếp tự pick bài khác.
+  // Sau MAX_FAIL_BEFORE_SKIP lần, bài này sẽ bị skip trong pickArticle.
+  let summary;
+  try {
+    console.log("[bot] Generating Vietnamese summary with Gemini...");
+    summary = await summarizeArticle(article, env);
+    console.log(`[bot]   Title: ${summary.title}`);
+  } catch (err) {
+    const fc = await incrementFailCount(env, article.link).catch(() => -1);
+    console.error(
+      `[bot] Gemini failed for "${article.title}" (fail count → ${fc}): ${(err as Error).message}`,
+    );
+    return; // không throw → cron không bị mark fail, slot tiếp vẫn chạy
+  }
 
-  // Đặt chỗ KV NGAY trước khi gửi Telegram (tránh dupe nếu cron + manual chạy đè).
+  // ────────── Bước 2: Reserve KV NGAY trước khi gửi Telegram ──────────
   await reservePost(env, article.link, summary.title);
 
+  // ────────── Bước 3: Post lên Telegram ──────────
   try {
     console.log("[bot] Posting to Telegram channel...");
     await postArticle(article, summary, env);
     console.log("[bot] Done!");
+    // Post thành công → xóa fail count (nếu trước đó từng fail nhưng giờ ok)
+    await clearFailCount(env, article.link).catch(() => undefined);
   } catch (err) {
-    // Telegram fail → hủy đặt chỗ để lần sau retry.
-    console.error("[bot] Telegram post failed; rolling back KV reservation");
+    // Telegram fail → rollback KV reservation và tăng fail count
+    console.error(
+      `[bot] Telegram post failed; rolling back. Error: ${(err as Error).message}`,
+    );
     await unreservePost(env, article.link).catch((e) => {
       console.warn(`[bot] Unreserve also failed: ${(e as Error).message}`);
     });
-    throw err;
+    const fc = await incrementFailCount(env, article.link).catch(() => -1);
+    console.warn(`[bot] Fail count for this URL → ${fc}`);
+    return; // không throw → slot kế cứ thử bài khác
   }
 }
 
