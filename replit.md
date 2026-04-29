@@ -70,6 +70,20 @@ Deployed to Cloudflare Workers. Migrated từ GitHub Actions vì GH Actions cron
   - **`runBot` ghi `lastAiError` vào `RunResult.reason`**: dry-run / `/run` giờ lộ message thực của provider cuối (không cần `wrangler tail`).
   - **`/top_today` thêm `topPreGate`**: top 10 bài có score cao nhất TRƯỚC khi qua MIN_SCORE_THRESHOLD + KV check → nhìn được score thực tế của batch hiện tại.
   - **Endpoint MỚI `/diag_ai`** (cần Bearer): probe từng AI provider trên 1 article giả, KHÔNG chạm KV/Telegram/RSS. Trả `{provider, ok, ms, error}` cho từng cái — chẩn đoán "provider nào sống/chết" trong 1 request.
+- **Phase 18.5 (Apr 29, 2026) — Throughput + circuit breaker tuning**:
+  - **Cron 9 → 24 tick/ngày** (`wrangler.toml`): từ `0 0,2,4,6,8,10,12,14,16 * * *` về `0 * * * *`. Lý do: Phase 15+16+17 đã thắt scoring/dedup/threshold rất chặt → bài rác đã bị lọc ngay ở filter/score, không cần ép cron thưa để "bù chất". 9 tick/ngày + skip-low-score → thực tế chỉ post 3-6 bài/ngày, ít hơn cadence kỳ vọng.
+  - **MIN_SCORE_THRESHOLD 220 → 190** (`index.ts`). Lý do: dữ liệu Phase 16 cho thấy 220 quá cao — top scores clustering 218–248, chỉ ~3% bài qua → quá nhiều slot bỏ trống. 190 cho phép ~50% bài qua trong khi vẫn loại priority 3 + recency cũ + không boost.
+  - **MAX_CANDIDATES_PER_RUN 5 → 3** (`index.ts`): với circuit breaker mạnh hơn, provider chậm chết sớm → ít cần buffer 5 candidate. 3 vẫn dư cho retry khi 1-2 bài fail Telegram/AI.
+  - **AI timeout/retry mạnh hơn** (`worker/src/ai.ts`):
+    - `GEMINI_TIMEOUT_MS 20s → 10s`, `GEMINI_MAX_RETRIES 3 → 2`. Worst case 1 provider 66s → 22s.
+    - `PARSE_RETRIES_PER_PROVIDER 2 → 1` (LLM cùng prompt + temperature thường cho output tương tự, retry parse fail thường vô ích).
+  - **Circuit breaker mạnh hơn** (`classifyHttpError` + `callGemini`/`callOpenRouter`):
+    - **`408` (timeout) → fatal** (cũ: non-fatal). Slow provider chết ngay, không retry trong cùng candidate.
+    - **Client-side AbortError → 408 fatal**: client timeout cũng coi như provider chết → throw immediately.
+    - **5xx LẶP LẠI ≥2 lần trong cùng provider attempt flow → markDead**: thêm flag `markDead` trên `ProviderError`. Khi `callGemini`/`callOpenRouter` đếm `serverErrorCount >= 2` sau exhaust retries → set `lastErr.markDead = true`. `summarizeArticle` catch giờ check cả `err.fatal || err.markDead` → add vào `deadProviders` Set → candidate sau trong cùng run skip provider đó ngay.
+  - **Tác động đo được**: dry-run worst-case (mọi provider dead từ candidate 1) chạy 9.5s thay vì worst-case cũ ~20 phút. Số bài/ngày dự kiến: 3-6 → 12-18.
+  - **Test:** 117/117 unit pass (3 test mới: 408 fatal, ProviderError.markDead default, markDead settable). `tsc --noEmit` clean. Deploy `5b1332e0-53be-4d47-8198-7d2595d1fed8`.
+  - **KHÔNG đổi**: bucket quota, MAX_AGE_HOURS, arxiv strict filter, fluff/path penalty, editorial scoring (ngoài scope).
 - **Phase 18 (Apr 29, 2026) — Task 6: cảnh báo Telegram khi skip slot do thiếu bài**:
   - **Counter mới `skipped:YYYY-MM-DD`** (`worker/src/skipCounter.ts`): mỗi tick mà bot bỏ trống slot vì lý do `all candidates below MIN_SCORE_THRESHOLD` → tăng counter. Key TTL 36h, auto-reset mỗi ngày. Chỉ tăng khi `dryRun=false` để admin curl `/run?dry=1` thoải mái không làm sai counter.
   - **Cảnh báo Telegram tối đa 1 lần/ngày, có retry**: khi `count ≥ SKIP_ALERT_THRESHOLD = 3` VÀ flag `skipped_alert_sent:YYYY-MM-DD` chưa set → thử gửi. Set flag CHỈ KHI gửi thành công. Nếu Telegram down đúng tick count=3 → tick sau (count=4) sẽ retry, không miss alert. Khi flag đã set → silent hết ngày (không spam mỗi 2h). Gửi qua `sendAdminAlert()` mới ở `worker/src/telegram.ts` → endpoint `sendMessage` tới `TELEGRAM_ADMIN_CHAT_ID`.
@@ -91,7 +105,7 @@ Deployed to Cloudflare Workers. Migrated từ GitHub Actions vì GH Actions cron
   2. Score article: `sourceWeight + recency + keyword(boost-penalty) + primaryLab + engineering + depth − hnPenalty`
   3. Cluster intra-batch (jaccard ≥ 0.80) — winner = source priority thấp hơn
   4. KV check exact (URL + title hash) → fuzzy check (jaccard ≥ 0.88 vs 200 title gần nhất)
-  5. **Min-score gate** (Phase 15): bài score < 220 bị skip — thà bỏ slot còn hơn lấp bằng bài rác. Sau đó bucket selection theo quota cap: `core 6 / ai 5 / dev 4 / research 1 / trend 2 = 18` (cap, cron chỉ 9 tick/ngày); fallback highest score nếu mọi bucket đầy
+  5. **Min-score gate** (Phase 15 → Phase 18.5): bài score < **190** bị skip — thà bỏ slot còn hơn lấp bằng bài rác. Sau đó bucket selection theo quota cap: `core 6 / ai 5 / dev 4 / research 1 / trend 2 = 18` (cap, cron 24 tick/ngày từ Phase 18.5); fallback highest score nếu mọi bucket đầy
   6. **AI summarize chain (Phase 9 + 9.2)**: `{ title, bullets[], whyItMatters }` — `getProviders(env)` build chain động dựa trên env, dừng ở cái đầu tiên thành công. Thứ tự:
      1. **Gemini 2.5 Flash** (1 provider/key) — quality cao nhất, ưu tiên
      2. **Gemini 2.0 Flash** (1 provider/key) — quota cao hơn, fallback khi 2.5 cạn
@@ -100,7 +114,7 @@ Deployed to Cloudflare Workers. Migrated từ GitHub Actions vì GH Actions cron
 
      **Key rotation (Phase 9.2)**: nếu set `GOOGLE_API_KEY_1.._5` (mỗi key 1 tài khoản Google = 1 quota free riêng), bot tạo provider riêng cho mỗi (model × key), tên thành `gemini-2.5-flash#k0`, `#k1`, ... Thứ tự: tất cả key cho 2.5-flash trước → tất cả key cho 2.0-flash → OpenRouter. Chỉ 1 key thì giữ tên cũ "gemini-2.5-flash" (backward compat).
 
-     HTTP `429/401/403` từ provider → coi là fatal cho provider đó, fallback ngay sang provider kế (run-scoped circuit breaker `Set<string> deadProviders` skip ngay ở article kế tiếp). HTTP `5xx`/`408`/timeout → retry trong cùng provider (PARSE_RETRIES=2). Provider được dùng được log + ghi vào `last_posted_v1.provider`.
+     **Circuit breaker (Phase 18.5)**: HTTP `429/401/403/408` + client-side timeout → fatal cho provider đó, fallback ngay sang provider kế VÀ add vào `deadProviders` Set (run-scoped) → candidate sau skip ngay. HTTP `5xx` → retry trong cùng provider (max 2); nếu lặp ≥ 2 lần → set `markDead` trên error → cũng add vào `deadProviders`. `PARSE_RETRIES_PER_PROVIDER=1`. Provider được dùng được log + ghi vào `last_posted_v1.provider`.
   7. Sau post: ghi posted/title/recent_titles/quota/last_posted (kèm `provider`)
 - **Multi-candidate retry**: mỗi cron tick có sẵn full ranked list; nếu AI/Telegram fail bài đầu, tự thử bài tiếp theo
 - **URL normalization**: dedupe dựa trên URL ĐÃ STRIP utm_*, fbclid, gclid, ref, fragment, sort params, lowercase host

@@ -78,24 +78,34 @@ function sleep(ms: number): Promise<void> {
 
 class ProviderError extends Error {
   status?: number;
-  /** Nếu true → bỏ luôn provider, không retry (vd 429 quota, 401 auth fail). */
+  /** Nếu true → bỏ luôn provider, không retry (vd 429 quota, 401 auth fail, 408 timeout). */
   fatal: boolean;
-  constructor(message: string, status?: number, fatal = false) {
+  /**
+   * Phase 18: nếu true → mark provider DEAD cho phần còn lại của run này
+   * (deadProviders.add). Khác `fatal`: `markDead` được set khi 5xx LẶP LẠI
+   * trong cùng provider attempt flow (≥2 lần) — không phải HTTP-class fatal,
+   * nhưng đủ tín hiệu để skip provider này cho candidate sau.
+   */
+  markDead: boolean;
+  constructor(message: string, status?: number, fatal = false, markDead = false) {
     super(message);
     this.status = status;
     this.fatal = fatal;
+    this.markDead = markDead;
   }
 }
 
 function classifyHttpError(status: number): { fatal: boolean } {
   // 429 = quota / rate limit → coi như cạn, bỏ luôn provider
   // 401/403 = auth fail → bỏ luôn (admin phải sửa key)
-  // 408 = request timeout (server-side) → retryable, KHÔNG bỏ provider
-  // 5xx = server tạm lỗi → retry trong provider
+  // 408 = request timeout (server-side) → Phase 18: FATAL — provider quá chậm,
+  //       không retry, sang provider kế ngay (slow response = waste budget).
+  // 5xx = server tạm lỗi → retry trong provider; nếu lặp ≥2 lần, callXxx()
+  //       sẽ tự set markDead=true để skip cho candidate sau (xem call site).
   // 4xx khác = bad request → fatal vì retry vô ích
   if (status === 429) return { fatal: true };
   if (status === 401 || status === 403) return { fatal: true };
-  if (status === 408) return { fatal: false };
+  if (status === 408) return { fatal: true };
   if (status >= 500 && status < 600) return { fatal: false };
   if (status >= 400 && status < 500) return { fatal: true };
   return { fatal: false };
@@ -105,8 +115,12 @@ function classifyHttpError(status: number): { fatal: boolean } {
 // Provider: Gemini (REST API trực tiếp)
 // ────────────────────────────────────────────────────────────────────────────
 
-const GEMINI_TIMEOUT_MS = 20_000;
-const GEMINI_MAX_RETRIES = 3;
+// Phase 18 (Apr 29 2026): hạ 20s → 10s, 3 → 2 retry.
+// Lý do: free Gemini bình thường response < 5s; nếu > 10s nghĩa là endpoint
+// đang hang. Worst case 1 provider giờ = 2×10 + 2 (backoff) = 22s thay vì
+// 3×20 + 6 = 66s. Cùng với 408 → fatal, slow timeout không lặp lại candidate sau.
+const GEMINI_TIMEOUT_MS = 10_000;
+const GEMINI_MAX_RETRIES = 2;
 
 async function callGemini(
   modelId: string,
@@ -124,6 +138,11 @@ async function callGemini(
   };
 
   let lastErr: ProviderError | undefined;
+  // Phase 18: đếm số lần 5xx trong attempt flow này. Nếu ≥ 2 sau khi exhaust
+  // retries → mark provider dead cho phần còn lại của run (xem catch ở
+  // summarizeArticle). Lý do: 5xx 1 lần có thể là blip; 5xx LẶP LẠI là dấu
+  // hiệu provider/upstream đang down — không nên test lại với candidate kế.
+  let serverErrorCount = 0;
   for (let attempt = 0; attempt < GEMINI_MAX_RETRIES; attempt++) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
@@ -142,6 +161,7 @@ async function callGemini(
           res.status,
           fatal,
         );
+        if (res.status >= 500 && res.status < 600) serverErrorCount++;
         if (fatal) throw err;
         lastErr = err;
       } else {
@@ -155,11 +175,19 @@ async function callGemini(
     } catch (err) {
       if (err instanceof ProviderError && err.fatal) throw err;
       const isAbort = (err as Error).name === "AbortError";
-      lastErr = isAbort
-        ? new ProviderError(`Gemini ${modelId} timeout ${GEMINI_TIMEOUT_MS}ms`, 408, false)
-        : err instanceof ProviderError
-          ? err
-          : new ProviderError(`Gemini ${modelId} network: ${(err as Error).message}`, undefined, false);
+      if (isAbort) {
+        // Phase 18: client-side timeout = 408 = fatal (xem classifyHttpError).
+        // Throw ngay để summarizeArticle mark provider dead, không waste retry.
+        const { fatal } = classifyHttpError(408);
+        throw new ProviderError(
+          `Gemini ${modelId} timeout ${GEMINI_TIMEOUT_MS}ms`,
+          408,
+          fatal,
+        );
+      }
+      lastErr = err instanceof ProviderError
+        ? err
+        : new ProviderError(`Gemini ${modelId} network: ${(err as Error).message}`, undefined, false);
     } finally {
       clearTimeout(timeoutId);
     }
@@ -171,6 +199,14 @@ async function callGemini(
       );
       await sleep(backoffMs);
     }
+  }
+  // Phase 18: nếu ≥2 lần 5xx → upgrade lastErr thành markDead để summarizeArticle
+  // bỏ provider này cho candidate sau.
+  if (lastErr && serverErrorCount >= 2) {
+    lastErr.markDead = true;
+    console.warn(
+      `[ai] Gemini ${modelId} 5xx lặp ${serverErrorCount} lần → mark dead cho run này.`,
+    );
   }
   throw lastErr ?? new ProviderError(`Gemini ${modelId} unknown failure`, undefined, false);
 }
@@ -207,6 +243,8 @@ async function callOpenRouter(
   };
 
   let lastErr: ProviderError | undefined;
+  // Phase 18: cùng cơ chế đếm 5xx như Gemini → mark dead nếu ≥2 lần.
+  let serverErrorCount = 0;
   for (let attempt = 0; attempt < OPENROUTER_MAX_RETRIES; attempt++) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), OPENROUTER_TIMEOUT_MS);
@@ -231,6 +269,7 @@ async function callOpenRouter(
           res.status,
           fatal,
         );
+        if (res.status >= 500 && res.status < 600) serverErrorCount++;
         if (fatal) throw err;
         lastErr = err;
       } else {
@@ -249,6 +288,7 @@ async function callOpenRouter(
             code,
             isFatal,
           );
+          if (code >= 500 && code < 600) serverErrorCount++;
           if (isFatal) throw err;
           lastErr = err;
         } else {
@@ -262,15 +302,22 @@ async function callOpenRouter(
     } catch (err) {
       if (err instanceof ProviderError && err.fatal) throw err;
       const isAbort = (err as Error).name === "AbortError";
-      lastErr = isAbort
-        ? new ProviderError(`OpenRouter[${model}] timeout ${OPENROUTER_TIMEOUT_MS}ms`, 408, false)
-        : err instanceof ProviderError
-          ? err
-          : new ProviderError(
-              `OpenRouter[${model}] network: ${(err as Error).message}`,
-              undefined,
-              false,
-            );
+      if (isAbort) {
+        // Phase 18: client-side timeout = 408 = fatal.
+        const { fatal } = classifyHttpError(408);
+        throw new ProviderError(
+          `OpenRouter[${model}] timeout ${OPENROUTER_TIMEOUT_MS}ms`,
+          408,
+          fatal,
+        );
+      }
+      lastErr = err instanceof ProviderError
+        ? err
+        : new ProviderError(
+            `OpenRouter[${model}] network: ${(err as Error).message}`,
+            undefined,
+            false,
+          );
     } finally {
       clearTimeout(timeoutId);
     }
@@ -282,6 +329,12 @@ async function callOpenRouter(
       );
       await sleep(backoffMs);
     }
+  }
+  if (lastErr && serverErrorCount >= 2) {
+    lastErr.markDead = true;
+    console.warn(
+      `[ai] OpenRouter[${model}] 5xx lặp ${serverErrorCount} lần → mark dead cho run này.`,
+    );
   }
   throw lastErr ?? new ProviderError("OpenRouter unknown failure", undefined, false);
 }
@@ -429,7 +482,10 @@ function sanitizeBullets(raw: unknown[]): string[] {
 // Main entry
 // ────────────────────────────────────────────────────────────────────────────
 
-const PARSE_RETRIES_PER_PROVIDER = 2;
+// Phase 18 (Apr 29 2026): hạ 2 → 1.
+// Lý do: nếu provider trả non-JSON 1 lần thì retry 1 lần nữa thường cũng fail
+// (LLM cùng prompt, cùng temperature → output tương tự). Tiết kiệm 1 round-trip.
+const PARSE_RETRIES_PER_PROVIDER = 1;
 
 /**
  * Tóm tắt bài viết. Build provider chain từ env (xem `getProviders`) rồi thử
@@ -491,6 +547,17 @@ export async function summarizeArticle(
           console.warn(`[ai] ${provider.name} FATAL (status=${err.status}) → fallback. ${msg}`);
           errors.push(`${provider.name}: ${msg}`);
           // Mark provider as dead cho các article tiếp theo trong cùng run
+          deadProviders?.add(provider.name);
+          providerSkipped = true;
+          break;
+        }
+        // Phase 18: nếu callXxx() đã exhaust retries với 5xx lặp lại ≥2 lần
+        // → markDead = true → cũng add vào deadProviders cho candidate sau.
+        if (err instanceof ProviderError && err.markDead) {
+          console.warn(
+            `[ai] ${provider.name} DEAD-FOR-RUN (status=${err.status}, 5xx lặp) → fallback. ${msg}`,
+          );
+          errors.push(`${provider.name}: ${msg}`);
           deadProviders?.add(provider.name);
           providerSkipped = true;
           break;

@@ -1020,8 +1020,23 @@ test("ai.ProviderError: fatal flag được giữ", () => {
   assert.equal(e.status, 429);
 });
 
-test("ai.classifyHttpError: 408 → non-fatal (timeout retryable)", () => {
-  assert.equal(aiTest.classifyHttpError(408).fatal, false);
+test("ai.classifyHttpError: 408 → fatal (Phase 18: timeout = waste budget)", () => {
+  assert.equal(aiTest.classifyHttpError(408).fatal, true);
+});
+
+test("ai.ProviderError: markDead flag default false, settable via constructor", () => {
+  const e = new aiTest.ProviderError("test", 500, false);
+  assert.equal(e.markDead, false);
+  const e2 = new aiTest.ProviderError("test", 500, false, true);
+  assert.equal(e2.markDead, true);
+  assert.equal(e2.fatal, false);
+});
+
+test("ai.ProviderError: markDead có thể set sau khi tạo (Phase 18 5xx lặp)", () => {
+  const e = new aiTest.ProviderError("test", 503, false);
+  assert.equal(e.markDead, false);
+  e.markDead = true;
+  assert.equal(e.markDead, true);
 });
 
 // ────────────────────────────────────────────────────────────────────────────

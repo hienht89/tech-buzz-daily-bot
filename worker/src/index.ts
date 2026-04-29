@@ -105,25 +105,32 @@ const MAX_AGE_HOURS = 30;
  * Nếu Gemini hoặc Telegram fail bài đầu, bot sẽ tự thử tiếp bài tiếp theo
  * cho đến khi post thành công hoặc hết MAX_CANDIDATES_PER_RUN.
  * Tránh trường hợp 1 bài hỏng làm miss cả slot.
+ *
+ * Phase 18 (Apr 29 2026): giảm 5 → 3 để giới hạn worst-case latency mỗi run.
+ * Với circuit breaker mạnh hơn (408 fatal + 5xx-repeat mark dead), provider
+ * chậm chết sớm → ít cần buffer 5 candidate. 3 candidate vẫn dư cho retry
+ * khi 1-2 bài fail Telegram/AI.
  */
-const MAX_CANDIDATES_PER_RUN = 5;
+const MAX_CANDIDATES_PER_RUN = 3;
 
 /**
- * Min score để 1 bài được coi là "đáng post" (Phase 15, Apr 2026).
+ * Min score để 1 bài được coi là "đáng post" (Phase 15 → Phase 18).
  *
- * Triết lý: thà skip slot còn hơn lấp slot bằng bài rác. Cron đã giảm 18→9
- * tick/ngày — nếu bài top-score vẫn dưới ngưỡng này, bot SẼ KHÔNG POST trong
- * tick đó, log reason="all candidates below MIN_SCORE_THRESHOLD".
+ * Triết lý: thà skip slot còn hơn lấp slot bằng bài rác. Nếu bài top-score
+ * vẫn dưới ngưỡng này, bot SẼ KHÔNG POST trong tick đó, log
+ * reason="all candidates below MIN_SCORE_THRESHOLD".
  *
- * Ngưỡng 220 chọn dựa trên dry-run thực tế:
- *   - Source priority 1 (100) + recency fresh (≥50) + keyword boost typical
- *     (≥40) + domain trust (≥10..25) ≈ 200..280 → bài tốt vẫn pass.
- *   - Bài score thấp dưới 220 thường là: arxiv niche + keyword yếu, hoặc
+ * Lịch sử:
+ *   - Phase 15 (Apr 28 2026): khởi đầu 220.
+ *   - Phase 18 (Apr 29 2026): hạ 220 → 190.
+ *     Lý do: dữ liệu thực 7 ngày qua cho thấy 220 quá cao — top scores
+ *     clustering quanh 218–248, chỉ ~3% bài qua ngưỡng → quá nhiều slot
+ *     bỏ trống. 190 cho phép ~50% bài qua filter trong khi vẫn loại
  *     priority 3 + recency cũ + không có boost.
  *
  * Có thể chỉnh xuống nếu thấy bot skip quá nhiều slot (xem `/stats` + log).
  */
-const MIN_SCORE_THRESHOLD = 220;
+const MIN_SCORE_THRESHOLD = 190;
 
 /**
  * Số slot/ngày bị skip do "all candidates below MIN_SCORE_THRESHOLD" trước
