@@ -16,9 +16,9 @@ worker/
 │   ├── bucket.ts      # quota bucket selection (core/ai/dev/research/trend)
 │   ├── url.ts         # canonical URL normalize
 │   ├── storage.ts     # KV wrappers (posted, title, recent_titles, quota, last_posted, failed)
-│   ├── ai.ts          # Gemini call + parse Summary { title, bullets[], whyItMatters }
+│   ├── ai.ts          # Multi-provider chain (Gemini 2.5/2.0 → OpenRouter Llama/Gemma) + parse Summary { title, bullets[], whyItMatters }
 │   └── telegram.ts    # gửi photo/text + format caption HTML, smart truncate
-├── test/run-tests.ts  # 60 unit tests (Node --test)
+├── test/run-tests.ts  # 67 unit tests (Node --test)
 ├── wrangler.toml      # cron + KV binding + vars
 └── package.json
 ```
@@ -32,12 +32,18 @@ worker/
 5. KV exact check (URL hash + normalized title hash).
 6. Fuzzy check (jaccard ≥ 0.88 vs 200 title gần nhất).
 7. Bucket quota: `core 5 / ai 5 / dev 4 / research 2 / trend 2`. Fallback highest score nếu mọi bucket đầy.
-8. Gemini summarize (timeout 30s, retry 3 lần parse JSON).
+8. AI summarize qua **provider chain (Phase 9)** — thử lần lượt, dừng ở cái đầu OK:
+   1. `gemini-2.5-flash` (Google free)
+   2. `gemini-2.0-flash` (Google free, fallback khi 2.5 hết quota)
+   3. `openrouter-llama` (Llama 3.3 70B Instruct free)
+   4. `openrouter-gemma` (Gemma 3 27B IT free, model khác để né per-model rate-limit của OpenRouter)
+
+   HTTP `429/401/403`/`404` → fatal cho provider đó, fallback ngay. `5xx`/timeout → retry 2 lần trong cùng provider. Provider thành công được log + ghi `last_posted_v1.provider`.
 9. Format caption HTML (bullets + 💡 Vì sao đáng đọc + signature + link).
 10. Crawl og:image; gửi photo (≤1024 char caption) hoặc text (≤4096 char).
-11. Mark posted + push recent_title + increment quota + ghi last_posted.
+11. Mark posted + push recent_title + increment quota + ghi last_posted (kèm provider).
 
-Nếu Gemini/Telegram fail bài đầu, lặp candidate kế tiếp cho đến khi post được hoặc hết.
+Nếu AI/Telegram fail bài đầu, lặp candidate kế tiếp cho đến khi post được hoặc hết.
 
 ## KV layout
 
@@ -78,9 +84,13 @@ npx wrangler dev          # local dev (cần secrets local)
 
 ```bash
 npx wrangler secret put TELEGRAM_BOT_TOKEN
-npx wrangler secret put GOOGLE_API_KEY
+npx wrangler secret put GOOGLE_API_KEY        # Gemini key (provider 1+2 trong chain)
+npx wrangler secret put OPENROUTER_API_KEY    # Optional — provider 3+4 (Llama/Gemma free) chỉ chạy khi có
 npx wrangler secret put RUN_TRIGGER_TOKEN
 ```
+
+> Nếu KHÔNG set `OPENROUTER_API_KEY`, bot vẫn chạy với chỉ Gemini (cũ) — chain
+> tự skip provider không khả dụng. Lấy key free tại <https://openrouter.ai/keys>.
 
 ## Tunables nhanh
 

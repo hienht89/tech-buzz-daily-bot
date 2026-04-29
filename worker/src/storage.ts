@@ -192,6 +192,8 @@ export type LastPostedSnapshot = {
   category: string;
   score: number;
   postedAt: string;
+  /** AI provider đã summarize bài này (vd "gemini-2.5-flash", "openrouter-llama"). */
+  provider?: string;
 };
 
 export async function setLastPosted(env: Env, snap: LastPostedSnapshot): Promise<void> {

@@ -586,3 +586,59 @@ test("ai.tryParseSummary: thiếu field → null", () => {
   assert.equal(aiTest.tryParseSummary(JSON.stringify({ title: "x" })), null);
   assert.equal(aiTest.tryParseSummary("not json"), null);
 });
+
+// ────────────────────────────────────────────────────────────────────────────
+// Phase 9: AI provider chain — classifyHttpError + provider list
+// ────────────────────────────────────────────────────────────────────────────
+
+test("ai.classifyHttpError: 429 → fatal (quota)", () => {
+  assert.equal(aiTest.classifyHttpError(429).fatal, true);
+});
+
+test("ai.classifyHttpError: 401/403 → fatal (auth)", () => {
+  assert.equal(aiTest.classifyHttpError(401).fatal, true);
+  assert.equal(aiTest.classifyHttpError(403).fatal, true);
+});
+
+test("ai.classifyHttpError: 5xx → non-fatal (retry)", () => {
+  assert.equal(aiTest.classifyHttpError(500).fatal, false);
+  assert.equal(aiTest.classifyHttpError(502).fatal, false);
+  assert.equal(aiTest.classifyHttpError(503).fatal, false);
+  assert.equal(aiTest.classifyHttpError(504).fatal, false);
+});
+
+test("ai.classifyHttpError: 400/404 → fatal (bad request)", () => {
+  assert.equal(aiTest.classifyHttpError(400).fatal, true);
+  assert.equal(aiTest.classifyHttpError(404).fatal, true);
+});
+
+test("ai.PROVIDERS: chain 4 provider Gemini 2.5 → 2.0 → OR-llama → OR-gemma", () => {
+  const names = aiTest.PROVIDERS.map((p: { name: string }) => p.name);
+  assert.deepEqual(names, [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "openrouter-llama",
+    "openrouter-gemma",
+  ]);
+});
+
+test("ai.PROVIDERS.isAvailable: Gemini cần GOOGLE_API_KEY, OR cần OPENROUTER_API_KEY", () => {
+  const [g25, g20, orL, orG] = aiTest.PROVIDERS;
+  assert.equal(g25.isAvailable({ GOOGLE_API_KEY: "x" } as any), true);
+  assert.equal(g25.isAvailable({} as any), false);
+  assert.equal(g20.isAvailable({ GOOGLE_API_KEY: "x" } as any), true);
+  assert.equal(orL.isAvailable({ OPENROUTER_API_KEY: "x" } as any), true);
+  assert.equal(orL.isAvailable({} as any), false);
+  assert.equal(orG.isAvailable({ OPENROUTER_API_KEY: "x" } as any), true);
+  assert.equal(orG.isAvailable({} as any), false);
+});
+
+test("ai.ProviderError: fatal flag được giữ", () => {
+  const e = new aiTest.ProviderError("test", 429, true);
+  assert.equal(e.fatal, true);
+  assert.equal(e.status, 429);
+});
+
+test("ai.classifyHttpError: 408 → non-fatal (timeout retryable)", () => {
+  assert.equal(aiTest.classifyHttpError(408).fatal, false);
+});

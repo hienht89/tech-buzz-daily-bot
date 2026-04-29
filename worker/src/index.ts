@@ -40,6 +40,12 @@ export interface Env {
   TELEGRAM_BOT_TOKEN: string;
   TELEGRAM_CHANNEL_ID: string;
   GOOGLE_API_KEY: string;
+  /**
+   * OpenRouter API key — fallback khi Gemini hết quota (HTTP 429).
+   * Optional: nếu không set, bot chỉ chạy với Gemini (như hành vi cũ).
+   * Đăng ký free tại openrouter.ai → Settings → Keys.
+   */
+  OPENROUTER_API_KEY?: string;
   TELEGRAM_SIGNATURE?: string;
   TELEGRAM_SIGNATURE_EMOJI?: string;
   /**
@@ -298,6 +304,10 @@ async function runBotInternal(
   // Đảm bảo nếu candidate đầu fail, candidate tiếp theo vẫn ưu tiên bucket
   // còn slot — không vô tình post từ bucket đầy khi còn bucket trống.
   const tried = new Set<Article>();
+  // Circuit breaker (Phase 9.1): provider nào đã fatal (429/401/403) trong run
+  // này sẽ bị skip cho các article kế tiếp → tiết kiệm HTTP call khi quota cạn.
+  // Reset cho mỗi run vì giữa các tick (1h) quota có thể đã được restore.
+  const deadProviders = new Set<string>();
   let fallbackWarned = false;
   let attempts = 0;
   const total = pick.candidates.length;
@@ -331,22 +341,25 @@ async function runBotInternal(
       continue;
     }
 
-    // ───── Bước 1: Gemini summarize ─────
+    // ───── Bước 1: AI summarize (chain fallback Gemini → OpenRouter) ─────
     let summary;
+    let aiProvider = "unknown";
     try {
-      console.log(`${tag}   Summarizing with Gemini...`);
-      summary = await summarizeArticle(article, env);
-      console.log(`${tag}   Title: ${summary.title}`);
+      console.log(`${tag}   Summarizing (AI provider chain)...`);
+      const result = await summarizeArticle(article, env, deadProviders);
+      summary = result.summary;
+      aiProvider = result.provider;
+      console.log(`${tag}   [provider=${aiProvider}] Title: ${summary.title}`);
     } catch (err) {
       const fc = await incrementFailCount(env, article.link).catch(() => -1);
       console.error(
-        `${tag}   Gemini fail (count→${fc}): ${(err as Error).message?.slice(0, 200)}`,
+        `${tag}   AI fail (count→${fc}): ${(err as Error).message?.slice(0, 400)}`,
       );
       continue; // thử bài tiếp theo
     }
 
     if (dry) {
-      console.log(`${tag}   DRY RUN — would post: "${summary.title}"`);
+      console.log(`${tag}   DRY RUN — would post: "${summary.title}" [provider=${aiProvider}]`);
       return {
         runId,
         posted: false,
@@ -354,7 +367,7 @@ async function runBotInternal(
         postedTitle: summary.title,
         postedSource: article.source,
         postedLink: article.link,
-        reason: "dry-run",
+        reason: `dry-run (provider=${aiProvider})`,
       };
     }
 
@@ -408,12 +421,13 @@ async function runBotInternal(
         category: article.sourceCategory,
         score: article.score ?? 0,
         postedAt: new Date().toISOString(),
+        provider: aiProvider,
       }).catch((e) =>
         console.error(`${tag}   setLastPosted failed: ${(e as Error).message}`),
       );
 
       console.log(
-        `${tag}   ✅ Posted successfully. [${article.sourceCategory}, score=${article.score ?? 0}]`,
+        `${tag}   ✅ Posted successfully. [${article.sourceCategory}, score=${article.score ?? 0}, provider=${aiProvider}]`,
       );
       return {
         runId,

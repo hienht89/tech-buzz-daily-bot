@@ -1,21 +1,33 @@
 import type { Article } from "./rss.js";
 import type { Env } from "./index.js";
 
-const MODEL = "gemini-2.5-flash";
-
 /**
- * Summary mới (v2):
- *   - title: Tiêu đề tiếng Việt + emoji prefix
- *   - bullets: 2-3 bullet ngắn gọn, mỗi bullet 1 fact key
- *   - whyItMatters: 1 câu "Vì sao đáng đọc" — insight cho người đọc Gen Z
+ * Multi-provider AI summarizer với fallback chain.
  *
- * Backward compat: legacy { title, body, takeaway } vẫn parse được — convert
- * tự động sang format mới ở `tryParseSummary`.
+ * Provider order (try theo thứ tự, fail thì sang cái kế):
+ *   1. gemini-2.5-flash      — chất lượng tốt nhất, free tier ~ vài chục req/phút
+ *   2. gemini-2.0-flash      — model cũ hơn, có quota RIÊNG → khi 2.5 cạn vẫn chạy
+ *   3. openrouter (deepseek) — nhà cung cấp khác hoàn toàn, free tier độc lập
+ *
+ * Quy tắc bỏ provider:
+ *   - HTTP 429 (quota exhausted) → bỏ luôn provider đó cho cả run
+ *   - HTTP 5xx / timeout → retry trong provider 2 lần với backoff, fail → bỏ
+ *   - Parse JSON thất bại 2 lần → bỏ provider, sang provider kế
+ *
+ * Trả về `{ summary, provider }` để caller log model nào đã được dùng.
+ *
+ * Backward compat schema cũ { title, body, takeaway } vẫn parse được.
  */
+
 export type Summary = {
   title: string;
   bullets: string[];
   whyItMatters: string;
+};
+
+export type SummarizeResult = {
+  summary: Summary;
+  provider: string;
 };
 
 const PROMPT = `Bạn là biên tập viên cho kênh Telegram "Tech Buzz Daily" — kênh tin tức công nghệ tiếng Việt cho dân tech, tone Gen Z: trẻ, năng động, hơi "lầy" nhưng chuẩn xác.
@@ -59,12 +71,48 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-type GeminiHttpError = Error & { status?: number };
+// ────────────────────────────────────────────────────────────────────────────
+// Error types
+// ────────────────────────────────────────────────────────────────────────────
+
+class ProviderError extends Error {
+  status?: number;
+  /** Nếu true → bỏ luôn provider, không retry (vd 429 quota, 401 auth fail). */
+  fatal: boolean;
+  constructor(message: string, status?: number, fatal = false) {
+    super(message);
+    this.status = status;
+    this.fatal = fatal;
+  }
+}
+
+function classifyHttpError(status: number): { fatal: boolean } {
+  // 429 = quota / rate limit → coi như cạn, bỏ luôn provider
+  // 401/403 = auth fail → bỏ luôn (admin phải sửa key)
+  // 408 = request timeout (server-side) → retryable, KHÔNG bỏ provider
+  // 5xx = server tạm lỗi → retry trong provider
+  // 4xx khác = bad request → fatal vì retry vô ích
+  if (status === 429) return { fatal: true };
+  if (status === 401 || status === 403) return { fatal: true };
+  if (status === 408) return { fatal: false };
+  if (status >= 500 && status < 600) return { fatal: false };
+  if (status >= 400 && status < 500) return { fatal: true };
+  return { fatal: false };
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Provider: Gemini (REST API trực tiếp)
+// ────────────────────────────────────────────────────────────────────────────
 
 const GEMINI_TIMEOUT_MS = 20_000;
+const GEMINI_MAX_RETRIES = 3;
 
-async function callGemini(article: Article, apiKey: string): Promise<string> {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${apiKey}`;
+async function callGemini(
+  modelId: string,
+  article: Article,
+  apiKey: string,
+): Promise<string> {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${apiKey}`;
   const reqBody = {
     contents: [{ role: "user", parts: [{ text: buildPrompt(article) }] }],
     generationConfig: {
@@ -74,9 +122,8 @@ async function callGemini(article: Article, apiKey: string): Promise<string> {
     },
   };
 
-  const maxRetries = 4;
-  let lastErr: unknown;
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
+  let lastErr: ProviderError | undefined;
+  for (let attempt = 0; attempt < GEMINI_MAX_RETRIES; attempt++) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
     try {
@@ -88,57 +135,202 @@ async function callGemini(article: Article, apiKey: string): Promise<string> {
       });
       if (!res.ok) {
         const errText = await res.text().catch(() => "");
-        const err = new Error(
-          `Gemini HTTP ${res.status}: ${errText.slice(0, 300)}`,
-        ) as GeminiHttpError;
-        err.status = res.status;
-        throw err;
+        const { fatal } = classifyHttpError(res.status);
+        const err = new ProviderError(
+          `Gemini ${modelId} HTTP ${res.status}: ${errText.slice(0, 300)}`,
+          res.status,
+          fatal,
+        );
+        if (fatal) throw err;
+        lastErr = err;
+      } else {
+        const data = (await res.json()) as {
+          candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+        };
+        const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (!text) throw new ProviderError(`Gemini ${modelId} empty response`, undefined, false);
+        return text;
       }
-      const data = (await res.json()) as {
-        candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
-      };
-      const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-      if (!text) throw new Error("Gemini returned empty response");
-      return text;
     } catch (err) {
-      lastErr = err;
+      if (err instanceof ProviderError && err.fatal) throw err;
       const isAbort = (err as Error).name === "AbortError";
-      if (isAbort) {
-        const wrapped = new Error(`Gemini timeout after ${GEMINI_TIMEOUT_MS}ms`) as GeminiHttpError;
-        wrapped.status = 408;
-        lastErr = wrapped;
-      }
-      const status = (lastErr as GeminiHttpError).status;
-      const msg = (lastErr as Error).message?.toLowerCase() ?? "";
-      const retryable =
-        isAbort ||
-        status === 429 ||
-        status === 500 ||
-        status === 502 ||
-        status === 503 ||
-        status === 504 ||
-        msg.includes("unavailable") ||
-        msg.includes("overloaded") ||
-        msg.includes("rate") ||
-        msg.includes("fetch");
-      if (!retryable || attempt === maxRetries - 1) throw lastErr;
-      const backoffMs = 2000 * Math.pow(2, attempt);
-      console.warn(
-        `[ai] Gemini retry ${attempt + 1}/${maxRetries} in ${backoffMs}ms: ${(lastErr as Error).message?.slice(0, 200)}`,
-      );
-      await sleep(backoffMs);
+      lastErr = isAbort
+        ? new ProviderError(`Gemini ${modelId} timeout ${GEMINI_TIMEOUT_MS}ms`, 408, false)
+        : err instanceof ProviderError
+          ? err
+          : new ProviderError(`Gemini ${modelId} network: ${(err as Error).message}`, undefined, false);
     } finally {
       clearTimeout(timeoutId);
     }
+    if (attempt < GEMINI_MAX_RETRIES - 1) {
+      const backoffMs = 2000 * Math.pow(2, attempt);
+      console.warn(
+        `[ai] Gemini ${modelId} retry ${attempt + 1}/${GEMINI_MAX_RETRIES} ` +
+          `in ${backoffMs}ms: ${lastErr?.message?.slice(0, 200)}`,
+      );
+      await sleep(backoffMs);
+    }
   }
-  throw lastErr;
+  throw lastErr ?? new ProviderError(`Gemini ${modelId} unknown failure`, undefined, false);
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Provider: OpenRouter (OpenAI-compatible chat completions)
+// ────────────────────────────────────────────────────────────────────────────
+
+const OPENROUTER_TIMEOUT_MS = 25_000;
+const OPENROUTER_MAX_RETRIES = 2;
 /**
- * Parse JSON từ Gemini. Hỗ trợ:
+ * OpenRouter free models. Mỗi model là 1 provider riêng trong chain để
+ * resilient với per-model upstream rate-limit (free tier OpenRouter giới hạn
+ * theo model).
+ *
+ * Nếu model bị deprecated (HTTP 404 "No endpoints found"), liệt kê model free
+ * mới qua `GET https://openrouter.ai/api/v1/models` rồi filter id chứa ":free".
+ */
+const OPENROUTER_MODEL_LLAMA = "meta-llama/llama-3.3-70b-instruct:free";
+const OPENROUTER_MODEL_GEMMA = "google/gemma-3-27b-it:free";
+
+async function callOpenRouter(
+  model: string,
+  article: Article,
+  apiKey: string,
+): Promise<string> {
+  const url = "https://openrouter.ai/api/v1/chat/completions";
+  const reqBody = {
+    model,
+    messages: [{ role: "user", content: buildPrompt(article) }],
+    response_format: { type: "json_object" },
+    temperature: 0.7,
+    max_tokens: 1024,
+  };
+
+  let lastErr: ProviderError | undefined;
+  for (let attempt = 0; attempt < OPENROUTER_MAX_RETRIES; attempt++) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), OPENROUTER_TIMEOUT_MS);
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+          // OpenRouter dùng để rank app — không bắt buộc nhưng nên có
+          "HTTP-Referer": "https://techbuzz-bot.workers.dev",
+          "X-Title": "Tech Buzz Daily Bot",
+        },
+        body: JSON.stringify(reqBody),
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        const errText = await res.text().catch(() => "");
+        const { fatal } = classifyHttpError(res.status);
+        const err = new ProviderError(
+          `OpenRouter[${model}] HTTP ${res.status}: ${errText.slice(0, 300)}`,
+          res.status,
+          fatal,
+        );
+        if (fatal) throw err;
+        lastErr = err;
+      } else {
+        const data = (await res.json()) as {
+          choices?: Array<{ message?: { content?: string } }>;
+          error?: { message?: string; code?: number };
+        };
+        // OpenRouter có thể trả 200 nhưng body có error (rate limit ngầm)
+        if (data.error) {
+          // OpenRouter có thể trả code dưới dạng string ("429") hoặc number (429).
+          // Normalize qua Number() để fatal detection không bị miss.
+          const code = Number(data.error.code ?? 0) || 0;
+          const isFatal = code === 429 || code === 401 || code === 403;
+          const err = new ProviderError(
+            `OpenRouter[${model}] body error: ${data.error.message ?? "unknown"}`,
+            code,
+            isFatal,
+          );
+          if (isFatal) throw err;
+          lastErr = err;
+        } else {
+          const text = data?.choices?.[0]?.message?.content;
+          if (!text) {
+            throw new ProviderError("OpenRouter empty response", undefined, false);
+          }
+          return text;
+        }
+      }
+    } catch (err) {
+      if (err instanceof ProviderError && err.fatal) throw err;
+      const isAbort = (err as Error).name === "AbortError";
+      lastErr = isAbort
+        ? new ProviderError(`OpenRouter[${model}] timeout ${OPENROUTER_TIMEOUT_MS}ms`, 408, false)
+        : err instanceof ProviderError
+          ? err
+          : new ProviderError(
+              `OpenRouter[${model}] network: ${(err as Error).message}`,
+              undefined,
+              false,
+            );
+    } finally {
+      clearTimeout(timeoutId);
+    }
+    if (attempt < OPENROUTER_MAX_RETRIES - 1) {
+      const backoffMs = 2000 * Math.pow(2, attempt);
+      console.warn(
+        `[ai] OpenRouter retry ${attempt + 1}/${OPENROUTER_MAX_RETRIES} in ${backoffMs}ms: ` +
+          `${lastErr?.message?.slice(0, 200)}`,
+      );
+      await sleep(backoffMs);
+    }
+  }
+  throw lastErr ?? new ProviderError("OpenRouter unknown failure", undefined, false);
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Provider chain definition
+// ────────────────────────────────────────────────────────────────────────────
+
+type Provider = {
+  name: string;
+  /** Có khả dụng không (vd thiếu API key thì skip). */
+  isAvailable: (env: Env) => boolean;
+  call: (article: Article, env: Env) => Promise<string>;
+};
+
+const PROVIDERS: readonly Provider[] = [
+  {
+    name: "gemini-2.5-flash",
+    isAvailable: (env) => !!env.GOOGLE_API_KEY,
+    call: (article, env) => callGemini("gemini-2.5-flash", article, env.GOOGLE_API_KEY),
+  },
+  {
+    name: "gemini-2.0-flash",
+    isAvailable: (env) => !!env.GOOGLE_API_KEY,
+    call: (article, env) => callGemini("gemini-2.0-flash", article, env.GOOGLE_API_KEY),
+  },
+  {
+    name: "openrouter-llama",
+    isAvailable: (env) => !!env.OPENROUTER_API_KEY,
+    call: (article, env) =>
+      callOpenRouter(OPENROUTER_MODEL_LLAMA, article, env.OPENROUTER_API_KEY!),
+  },
+  {
+    // Provider thứ 4: model OpenRouter khác để khi Llama bị upstream rate-limit
+    // (free tier OpenRouter giới hạn theo model riêng) vẫn còn cửa.
+    name: "openrouter-gemma",
+    isAvailable: (env) => !!env.OPENROUTER_API_KEY,
+    call: (article, env) =>
+      callOpenRouter(OPENROUTER_MODEL_GEMMA, article, env.OPENROUTER_API_KEY!),
+  },
+];
+
+// ────────────────────────────────────────────────────────────────────────────
+// Parse logic (không thay đổi vs phiên bản trước)
+// ────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Parse JSON từ LLM. Hỗ trợ:
  *   - Schema mới: { title, bullets[], whyItMatters }
  *   - Schema cũ:  { title, body, takeaway } → convert sang bullets từ body
- *     (split theo câu, lấy 2-3 câu)
  *
  * Sanitize bullets: bỏ marker đầu ('-', '•', '*', '·', '–', '—'), trim.
  */
@@ -195,28 +387,103 @@ function sanitizeBullets(raw: unknown[]): string[] {
   return out;
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Main entry
+// ────────────────────────────────────────────────────────────────────────────
+
+const PARSE_RETRIES_PER_PROVIDER = 2;
+
 /**
- * Helpers for testing.
+ * Tóm tắt bài viết. Thử lần lượt từng provider trong PROVIDERS.
+ *
+ * Mỗi provider được:
+ *   - thử tối đa PARSE_RETRIES_PER_PROVIDER lần để parse JSON hợp lệ
+ *   - nếu HTTP fatal (429/401/403) → bỏ luôn provider, sang cái kế
+ *   - nếu network/timeout/5xx → đã retry sẵn trong callXxx()
+ *
+ * **Circuit breaker (Phase 9.1)**: caller có thể truyền `deadProviders` Set để
+ * lưu provider đã fatal trong run hiện tại. Mỗi article kế tiếp sẽ skip ngay
+ * provider đã chết → tiết kiệm HTTP call khi quota cạn. Set được mutate in-place.
+ *
+ * Throw nếu TẤT CẢ provider fail. Caller (index.ts) sẽ catch để thử bài kế tiếp.
  */
+export async function summarizeArticle(
+  article: Article,
+  env: Env,
+  deadProviders?: Set<string>,
+): Promise<SummarizeResult> {
+  const errors: string[] = [];
+
+  for (const provider of PROVIDERS) {
+    if (!provider.isAvailable(env)) {
+      console.log(`[ai] Skip ${provider.name} — không có API key`);
+      continue;
+    }
+    if (deadProviders?.has(provider.name)) {
+      console.log(`[ai] Skip ${provider.name} — đã fatal trong run này (circuit breaker)`);
+      errors.push(`${provider.name}: skipped (dead)`);
+      continue;
+    }
+
+    let parseFailedTimes = 0;
+    let providerSkipped = false;
+    let lastRaw = "";
+
+    for (let attempt = 0; attempt < PARSE_RETRIES_PER_PROVIDER; attempt++) {
+      try {
+        const raw = await provider.call(article, env);
+        lastRaw = raw;
+        const summary = tryParseSummary(raw);
+        if (summary) {
+          if (errors.length > 0 || attempt > 0) {
+            console.log(`[ai] ✔ Success với ${provider.name} (sau khi thử ${errors.length} provider trước)`);
+          }
+          return { summary, provider: provider.name };
+        }
+        parseFailedTimes++;
+        console.warn(
+          `[ai] ${provider.name} parse fail ${attempt + 1}/${PARSE_RETRIES_PER_PROVIDER}. ` +
+            `Raw: ${raw.slice(0, 200)}`,
+        );
+        await sleep(500);
+      } catch (err) {
+        const msg = (err as Error).message?.slice(0, 200) ?? "unknown";
+        if (err instanceof ProviderError && err.fatal) {
+          console.warn(`[ai] ${provider.name} FATAL (status=${err.status}) → fallback. ${msg}`);
+          errors.push(`${provider.name}: ${msg}`);
+          // Mark provider as dead cho các article tiếp theo trong cùng run
+          deadProviders?.add(provider.name);
+          providerSkipped = true;
+          break;
+        }
+        // Non-fatal đã retry hết trong call*; coi như provider chết tạm.
+        // KHÔNG add vào deadProviders vì có thể chỉ network glitch tạm thời.
+        console.warn(`[ai] ${provider.name} non-fatal nhưng retry hết → fallback. ${msg}`);
+        errors.push(`${provider.name}: ${msg}`);
+        providerSkipped = true;
+        break;
+      }
+    }
+
+    if (!providerSkipped) {
+      // Đã hết PARSE_RETRIES mà vẫn parse fail
+      errors.push(
+        `${provider.name}: parse fail ${parseFailedTimes}x. Last raw: ${lastRaw.slice(0, 200)}`,
+      );
+    }
+  }
+
+  throw new Error(`All AI providers failed. Errors: ${errors.join(" | ")}`);
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Helpers for testing
+// ────────────────────────────────────────────────────────────────────────────
+
 export const __test = {
   tryParseSummary,
   sanitizeBullets,
+  classifyHttpError,
+  PROVIDERS,
+  ProviderError,
 };
-
-export async function summarizeArticle(article: Article, env: Env): Promise<Summary> {
-  const maxParseRetries = 3;
-  let lastRaw = "";
-  for (let attempt = 0; attempt < maxParseRetries; attempt++) {
-    const raw = await callGemini(article, env.GOOGLE_API_KEY);
-    lastRaw = raw;
-    const summary = tryParseSummary(raw);
-    if (summary) return summary;
-    console.warn(
-      `[ai] Failed to parse Gemini JSON (attempt ${attempt + 1}/${maxParseRetries}). Regenerating...`,
-    );
-    await sleep(1000);
-  }
-  throw new Error(
-    `Gemini returned unparseable/incomplete JSON after ${maxParseRetries} attempts. Last raw: ${lastRaw.slice(0, 500)}`,
-  );
-}

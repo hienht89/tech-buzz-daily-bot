@@ -53,9 +53,15 @@ Deployed to Cloudflare Workers. Migrated từ GitHub Actions vì GH Actions cron
   3. Cluster intra-batch (jaccard ≥ 0.80) — winner = source priority thấp hơn
   4. KV check exact (URL + title hash) → fuzzy check (jaccard ≥ 0.88 vs 200 title gần nhất)
   5. Bucket selection theo quota: `core 5 / ai 5 / dev 4 / research 2 / trend 2 = 18/ngày`; fallback highest score nếu mọi bucket đầy
-  6. Gemini summarize: `{ title, bullets[], whyItMatters }` — caption render `• bullets` + `💡 Vì sao đáng đọc`
-  7. Sau post: ghi posted/title/recent_titles/quota/last_posted
-- **Multi-candidate retry**: mỗi cron tick có sẵn full ranked list; nếu Gemini/Telegram fail bài đầu, tự thử bài tiếp theo
+  6. **AI summarize chain (Phase 9)**: `{ title, bullets[], whyItMatters }` — thử lần lượt 4 provider, dừng ở cái đầu tiên thành công:
+     1. **Gemini 2.5 Flash** (Google free tier)
+     2. **Gemini 2.0 Flash** (Google free tier — fallback khi 2.5 hết quota cùng key)
+     3. **OpenRouter Llama 3.3 70B Instruct** (free model)
+     4. **OpenRouter Gemma 3 27B IT** (free model — provider khác để né upstream rate-limit của Llama)
+
+     HTTP `429/401/403` từ provider → coi là fatal cho provider đó, fallback ngay sang provider kế. HTTP `5xx`/timeout → retry trong cùng provider (PARSE_RETRIES=2). Provider được dùng được log + ghi vào `last_posted_v1.provider`.
+  7. Sau post: ghi posted/title/recent_titles/quota/last_posted (kèm `provider`)
+- **Multi-candidate retry**: mỗi cron tick có sẵn full ranked list; nếu AI/Telegram fail bài đầu, tự thử bài tiếp theo
 - **URL normalization**: dedupe dựa trên URL ĐÃ STRIP utm_*, fbclid, gclid, ref, fragment, sort params, lowercase host
 - **Bundled với** `nodejs_compat`; RSS dùng `fast-xml-parser` + `fetch` (timeout 15s); Gemini gọi qua REST API (timeout 30s)
 
@@ -64,7 +70,8 @@ Deployed to Cloudflare Workers. Migrated từ GitHub Actions vì GH Actions cron
 | Tên | Mô tả |
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | Token từ @BotFather |
-| `GOOGLE_API_KEY` | Gemini API key |
+| `GOOGLE_API_KEY` | Gemini API key (provider 1+2 trong chain) |
+| `OPENROUTER_API_KEY` | **Optional** — API key từ openrouter.ai/keys (provider 3+4: Llama/Gemma free). Không set → bot vẫn chạy chỉ với Gemini như cũ. |
 | `RUN_TRIGGER_TOKEN` | Token RIÊNG để bảo vệ endpoint `/run` (KHÔNG dùng chung Telegram token) |
 
 #### Required vars (in `wrangler.toml`)
