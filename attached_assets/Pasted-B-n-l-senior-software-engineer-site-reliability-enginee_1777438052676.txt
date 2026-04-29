@@ -1,0 +1,293 @@
+Bạn là senior software engineer + site reliability engineer + product engineer. Hãy nâng cấp toàn diện bot Telegram RSS hiện có của tôi thành một hệ thống curated-news bot chất lượng cao, ổn định, ít spam, chống trùng tốt, dễ bảo trì, có logging và cấu hình rõ ràng.
+
+Mục tiêu:
+- Không chỉ fetch RSS rồi post lại
+- Phải lọc thông minh, deduplicate, scoring, chia category, chọn bài theo slot, tóm tắt đẹp cho Telegram
+- Giảm spam, tăng chất lượng, tăng tính đáng đọc
+- Giữ kiến trúc dễ mở rộng về sau
+
+Yêu cầu quan trọng:
+1. Không dừng lại khi mới tìm ra một lỗi đầu tiên
+2. Phải rà soát toàn bộ codebase để tìm tất cả lỗi tiềm ẩn, edge cases, điểm crash, data race, lỗi timezone, lỗi retry, lỗi RSS parsing, lỗi duplicate detection, lỗi markdown Telegram, lỗi HTML escaping, lỗi schedule, lỗi cache, lỗi scoring sai, lỗi ranking thiếu công bằng giữa các nguồn
+3. Không tự mặc định nguyên nhân đầu tiên là bug thật; hãy xác minh bằng code path, log path, data flow, config flow
+4. Refactor khi cần nhưng không phá vỡ chức năng đang có
+5. Sau khi sửa xong phải tự kiểm thử kỹ
+6. Phải để lại code sạch, có chú thích hợp lý, cấu hình dễ chỉnh, có file README hoặc docs ngắn giải thích cách chạy
+
+Danh sách RSS mới cần thay thế vào hệ thống:
+CORE:
+- TechCrunch: https://techcrunch.com/feed/
+- The Verge Tech: https://www.theverge.com/rss/tech/index.xml
+- Wired: https://www.wired.com/feed/rss
+- Ars Technica: https://feeds.arstechnica.com/arstechnica/index
+- BBC Technology: https://feeds.bbci.co.uk/news/technology/rss.xml
+
+AI:
+- OpenAI Blog: https://openai.com/news/rss.xml
+- Google AI Blog: https://blog.google/technology/ai/rss/
+- DeepMind Blog: https://deepmind.google/blog/rss.xml
+- Hugging Face Blog: https://huggingface.co/blog/feed.xml
+- Anthropic News: https://www.anthropic.com/news/rss.xml
+- Meta AI Blog: https://ai.facebook.com/blog/rss/
+- arXiv cs.AI: http://export.arxiv.org/rss/cs.AI
+
+DEV:
+- GitHub Blog: https://github.blog/feed/
+- Stack Overflow Blog: https://stackoverflow.blog/feed/
+- InfoQ: https://feed.infoq.com/
+- Netflix Tech Blog: https://netflixtechblog.com/feed
+
+RESEARCH / TREND:
+- Hacker News optimized: https://hnrss.org/frontpage?points=120
+- Papers with Code: https://paperswithcode.com/rss
+
+Những gì cần làm trong codebase:
+
+A. Audit toàn bộ hệ thống
+- Quét toàn bộ source code
+- Liệt kê các module chính
+- Mô tả data flow từ fetch -> parse -> filter -> dedup -> summarize -> publish
+- Chỉ ra tất cả lỗi tiềm ẩn và điểm cần cải thiện
+- Ưu tiên các lỗi production-impact trước:
+  - crash bot
+  - spam channel
+  - duplicate posts
+  - mất bài quan trọng
+  - đăng bài chất lượng thấp
+  - RSS timeout
+  - lỗi markdown Telegram
+  - lỗi parse date/timezone
+  - lỗi scheduler
+  - lỗi cache không hết hạn
+  - lỗi retry vô hạn
+  - lỗi race condition nếu có job chạy song song
+  - lỗi bài từ source gốc bị thua bài báo tổng hợp
+  - lỗi arXiv hoặc HN làm ngập feed
+
+B. Chuẩn hóa cấu trúc dữ liệu
+Tạo hoặc refactor về schema article thống nhất, ví dụ:
+- id
+- source_name
+- source_category
+- source_priority
+- title
+- normalized_title
+- url
+- canonical_url
+- author
+- published_at
+- summary
+- content_snippet
+- tags
+- language
+- score
+- dedup_key
+- fingerprint
+- fetched_at
+
+C. Fetcher robust
+- timeout riêng cho từng feed
+- retry có giới hạn
+- log rõ feed nào lỗi
+- nếu một feed lỗi thì không ảnh hưởng toàn bộ pipeline
+- hỗ trợ user-agent phù hợp
+- chuẩn hóa XML/RSS/Atom parsing
+- handle malformed feeds
+- handle empty feed
+- handle 301/302/redirect
+- handle gzip/compression nếu cần
+
+D. Filtering thông minh
+Loại hoặc giảm ưu tiên mạnh cho các bài có keyword sau trong title/summary nếu không thuộc bài rất quan trọng:
+- review
+- hands-on
+- rumor
+- leak
+- deal
+- sale
+- buy
+- accessory
+- opinion
+- sponsored
+
+Tăng ưu tiên cho các bài có keyword:
+- release
+- launches
+- benchmark
+- model
+- reasoning
+- agent
+- open source
+- inference
+- training
+- chips
+- nvidia
+- openai
+- anthropic
+- deepmind
+- security
+- github
+- outage
+- vulnerability
+
+E. Deduplicate nhiều lớp
+Triển khai dedup theo 3 lớp:
+1. exact duplicate:
+- cùng URL
+- cùng canonical URL
+- cùng GUID
+- cùng normalized title hash
+
+2. fuzzy title duplicate:
+- dùng string similarity
+- threshold cấu hình được, ví dụ 0.88
+
+3. event-level duplicate:
+- nếu nhiều nguồn nói cùng một sự kiện thì chỉ giữ một bài tốt nhất
+- ưu tiên source gốc hơn source tổng hợp
+- ưu tiên bài sâu hơn bài ngắn
+- ưu tiên bài có score cao hơn
+
+Nếu có thể, dùng heuristic semantic nhẹ để gom sự kiện, nhưng không kéo thêm dependency quá nặng nếu không cần.
+
+F. Scoring engine
+Xây dựng scoring có thể cấu hình được.
+Ví dụ các thành phần:
+- source_weight
+- recency_weight
+- keyword_boost
+- keyword_penalty
+- originality_boost
+- primary_source_boost
+- duplicate_penalty
+- depth_boost
+- relevance_to_channel_theme
+
+Yêu cầu:
+- source gốc như OpenAI/DeepMind/Anthropic/GitHub/Netflix Tech Blog được boost cao
+- bài báo tổng hợp không được lấn át source gốc nếu cùng sự kiện
+- arXiv cs.AI phải được lọc, tránh paper quá chung chung hoặc ít giá trị thực tế
+- HN chỉ là trend signal, không phải lúc nào cũng thắng bài chính thức
+
+G. Bucket selection thay vì top N đơn giản
+Hệ thống không chỉ lấy top score chung, mà chia slot theo category mỗi ngày:
+- big_news
+- ai
+- dev
+- tech
+- trend
+
+Mặc định đề xuất:
+- 3 big_news
+- 4 ai
+- 3 dev
+- 3 tech
+- 2 trend
+Tổng khoảng 15 bài/ngày
+
+Cho phép cấu hình lại quota theo category trong file config.
+
+H. Telegram formatter
+Tối ưu nội dung đăng Telegram:
+- tiêu đề ngắn gọn, hấp dẫn
+- 2 đến 4 bullet nêu điểm chính
+- 1 dòng “vì sao đáng chú ý”
+- link nguồn
+- format an toàn với Telegram Markdown hoặc HTML
+- escape ký tự đúng cách
+- không để lỗi format làm fail cả job publish
+
+I. Scheduling và anti-spam
+- không post dồn toàn bộ cùng lúc
+- hỗ trợ batch hoặc phân bổ theo khung giờ
+- rate limit hợp lý
+- có dry-run mode
+- có preview mode
+- có lock để tránh 2 job chạy cùng lúc gây duplicate
+
+J. Persistence / cache / state
+- lưu state bài đã đăng
+- lưu fingerprint / hash để tránh đăng lại
+- lưu lịch sử score và dedup nếu cần
+- cache có TTL rõ ràng
+- có migration an toàn nếu đổi schema
+
+K. Logging / observability
+Cần có log rõ ràng:
+- nguồn nào fetch thành công/thất bại
+- có bao nhiêu bài lấy được
+- bao nhiêu bài bị loại vì filter
+- bao nhiêu bài bị loại vì duplicate
+- bài nào được chọn đăng và vì sao
+- score breakdown của từng bài
+- lỗi parse / publish / summary
+- summary báo cáo cuối ngày
+
+L. Telegram bot admin commands
+Nếu codebase phù hợp, bổ sung:
+- /health
+- /sources
+- /stats
+- /last
+- /dryrun
+- /force_fetch
+- /top_today
+- /config
+
+M. Kiểm thử
+Viết hoặc cập nhật test cho:
+- RSS parser
+- normalization
+- duplicate detection
+- scoring
+- bucket selection
+- Telegram formatter
+- URL canonicalization
+- date parsing/timezone
+- source fallback
+- publish guard chống duplicate
+
+N. Documentation
+Cập nhật README hoặc docs tối thiểu gồm:
+- cách cấu hình token Telegram
+- cách cấu hình RSS feeds
+- cách bật/tắt nguồn
+- cách chạy local
+- cách chạy cron/scheduler
+- cách test
+- cách debug duplicate / missing article / formatting lỗi
+
+O. Output cuối cùng cần trả về
+Sau khi hoàn tất, hãy trả về:
+1. danh sách file đã sửa/tạo
+2. tóm tắt các lỗi đã phát hiện
+3. các thay đổi chính đã triển khai
+4. lý do thiết kế
+5. cách chạy
+6. cách kiểm thử
+7. các việc còn có thể cải thiện thêm trong tương lai
+
+Ràng buộc thực hiện:
+- Ưu tiên sửa đúng và chắc hơn là sửa nhanh
+- Không phá API cũ nếu không cần thiết
+- Nếu cần refactor, làm refactor sạch và nhất quán
+- Nếu một phần chưa chắc chắn, hãy để TODO rõ ràng thay vì ngầm đoán
+- Nếu chưa có thư viện phù hợp, có thể thêm dependency hợp lý nhưng giữ tối giản
+- Ưu tiên code rõ ràng, production-minded, dễ maintain
+
+Ngoài ra, hãy tinh chỉnh logic nguồn như sau:
+- Source gốc được ưu tiên hơn báo tổng hợp khi cùng sự kiện
+- arXiv cs.AI phải có bộ lọc mạnh hơn để tránh paper kém liên quan
+- Hacker News chỉ dùng như trend boost, không để chiếm quá nhiều slot
+- Netflix Tech, InfoQ, GitHub Blog, Stack Overflow Blog nên được boost ở bucket dev
+- OpenAI, Anthropic, DeepMind, Google AI, Hugging Face, Meta AI được boost trong bucket ai
+- TechCrunch, Verge, Wired, Ars, BBC là lớp phủ tổng quan nhưng không được lấn át bài từ source gốc
+
+Hãy bắt đầu bằng việc:
+1. khám phá cấu trúc project hiện tại
+2. xác định entry points
+3. tìm pipeline RSS/Telegram hiện có
+4. audit logic duplicate, filter, schedule, formatting
+5. sửa toàn bộ
+6. tự test lại
+7. trả về báo cáo hoàn chỉnh
