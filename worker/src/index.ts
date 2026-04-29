@@ -84,6 +84,23 @@ const MAX_AGE_HOURS = 30;
  */
 const MAX_CANDIDATES_PER_RUN = 5;
 
+/**
+ * Min score để 1 bài được coi là "đáng post" (Phase 15, Apr 2026).
+ *
+ * Triết lý: thà skip slot còn hơn lấp slot bằng bài rác. Cron đã giảm 18→9
+ * tick/ngày — nếu bài top-score vẫn dưới ngưỡng này, bot SẼ KHÔNG POST trong
+ * tick đó, log reason="all candidates below MIN_SCORE_THRESHOLD".
+ *
+ * Ngưỡng 220 chọn dựa trên dry-run thực tế:
+ *   - Source priority 1 (100) + recency fresh (≥50) + keyword boost typical
+ *     (≥40) + domain trust (≥10..25) ≈ 200..280 → bài tốt vẫn pass.
+ *   - Bài score thấp dưới 220 thường là: arxiv niche + keyword yếu, hoặc
+ *     priority 3 + recency cũ + không có boost.
+ *
+ * Có thể chỉnh xuống nếu thấy bot skip quá nhiều slot (xem `/stats` + log).
+ */
+const MIN_SCORE_THRESHOLD = 220;
+
 // ────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ────────────────────────────────────────────────────────────────────────────
@@ -122,6 +139,8 @@ type PickResult = {
   techCount: number;
   scoredCount: number;
   clusteredCount: number;
+  /** Số bài bị skip vì score < MIN_SCORE_THRESHOLD (Phase 15). */
+  skippedLowScore: number;
 };
 
 /**
@@ -170,6 +189,7 @@ async function pickCandidates(env: Env, runId: string): Promise<PickResult> {
       techCount: techTitle.length,
       scoredCount: 0,
       clusteredCount: 0,
+      skippedLowScore: 0,
     };
   }
 
@@ -189,13 +209,14 @@ async function pickCandidates(env: Env, runId: string): Promise<PickResult> {
   // Sort DESC theo score
   clustered.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
 
-  // Layer 1 + Layer 2 dedup vs KV
+  // Layer 1 + Layer 2 dedup vs KV + min-score gate
   const recentTitles = await getRecentTitles(env);
   const candidates: Article[] = [];
   let skippedPosted = 0;
   let skippedTitlePosted = 0;
   let skippedPoison = 0;
   let skippedFuzzy = 0;
+  let skippedLowScore = 0;
 
   for (const a of clustered) {
     if (await isPosted(env, a.link)) {
@@ -219,6 +240,16 @@ async function pickCandidates(env: Env, runId: string): Promise<PickResult> {
       );
       continue;
     }
+    // Min-score gate (Phase 15) — thà skip slot còn hơn post bài rác.
+    // Vì `clustered` đã sort DESC theo score, gặp bài đầu tiên dưới ngưỡng
+    // → tất cả bài còn lại cũng dưới ngưỡng → break sớm.
+    if ((a.score ?? 0) < MIN_SCORE_THRESHOLD) {
+      skippedLowScore++;
+      // Không break ngay vì có thể có 1-2 bài score thấp xen giữa do
+      // dedup loại các bài score cao hơn — nhưng đã sort DESC nên break
+      // là an toàn về mặt logic. Vẫn loop tiếp để đếm chính xác cho log.
+      continue;
+    }
     candidates.push(a);
     if (candidates.length >= MAX_CANDIDATES_PER_RUN) break;
   }
@@ -226,7 +257,8 @@ async function pickCandidates(env: Env, runId: string): Promise<PickResult> {
   console.log(
     `[bot:${runId}] Eligible after dedup: ${candidates.length} ` +
       `(skipped: ${skippedPosted} url-posted, ${skippedTitlePosted} title-posted, ` +
-      `${skippedPoison} poison, ${skippedFuzzy} fuzzy)`,
+      `${skippedPoison} poison, ${skippedFuzzy} fuzzy, ` +
+      `${skippedLowScore} below MIN_SCORE_THRESHOLD=${MIN_SCORE_THRESHOLD})`,
   );
 
   // Log top scoring candidates breakdown
@@ -244,6 +276,7 @@ async function pickCandidates(env: Env, runId: string): Promise<PickResult> {
     techCount: techTitle.length,
     scoredCount: arxivPassed.length,
     clusteredCount: clustered.length,
+    skippedLowScore,
   };
 }
 
@@ -304,7 +337,10 @@ async function runBotInternal(
         ? "no fresh articles (>48h)"
         : pick.techCount === 0
           ? "no tech-relevant articles after filter"
-          : "all candidates đã đăng / poison / dup";
+          : pick.skippedLowScore > 0 && pick.clusteredCount > 0
+            ? `all candidates below MIN_SCORE_THRESHOLD=${MIN_SCORE_THRESHOLD} ` +
+              `(${pick.skippedLowScore} bài bị skip vì score thấp) — slot bỏ trống ưu tiên chất lượng`
+            : "all candidates đã đăng / poison / dup";
     console.warn(`[bot:${runId}] No candidate to try. Reason: ${reason}`);
     return { runId, posted: false, attempted: 0, reason };
   }
@@ -672,6 +708,8 @@ export default {
           scoredCount: pick.scoredCount,
           clusteredCount: pick.clusteredCount,
           eligibleCount: pick.candidates.length,
+          minScoreThreshold: MIN_SCORE_THRESHOLD,
+          skippedLowScore: pick.skippedLowScore,
           top,
           checkedAt: new Date().toISOString(),
         };

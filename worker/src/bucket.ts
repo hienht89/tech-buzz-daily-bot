@@ -1,20 +1,25 @@
 /**
- * Bucket selection — đảm bảo 18 bài/ngày trải đều theo category.
+ * Bucket selection — cap số bài/category để 1 nhóm không dominate.
  *
- * Quota mặc định:
- *   core     = 5
+ * Quota mặc định (Phase 15, Apr 2026 — giảm research, tăng core):
+ *   core     = 6   (↑ từ 5 — báo lớn ổn định, ưu tiên)
  *   ai       = 5
  *   dev      = 4
- *   research = 2
+ *   research = 1   (↓ từ 2 — tránh arxiv niche dominate khi nguồn chính ít)
  *   trend    = 2
  *   ──────────────
- *   total    = 18  (khớp cron `0 0-17 * * *` UTC = 18 lần/ngày)
+ *   total    = 18  (cap; cron mới chỉ 9 tick/ngày → quota là cap chứ không phải target)
  *
- * Mỗi giờ cron tick → chạy 1 lần → đăng tối đa 1 bài. Ta chọn:
+ * Lưu ý: cron giảm 18 → 9 tick/ngày (xem `wrangler.toml`). Quota tổng vẫn 18
+ * vì đây là CAP (max) chứ không phải allocation. Trong điều kiện bình thường
+ * mỗi ngày chỉ post 9 bài, không bao giờ chạm cap. Cap chỉ kick in khi:
+ *   - 1 category có nhiều news ngon → cần phân bổ sang category khác
+ *   - manual trigger nhiều lần ngoài cron
+ *
+ * Mỗi tick cron → chạy 1 lần → đăng tối đa 1 bài. Ta chọn:
  *   1. Bucket nào còn quota → ưu tiên
  *   2. Trong các bucket còn quota, lấy candidate có score cao nhất
  *   3. Nếu TẤT CẢ bucket hết quota → fallback: chọn highest score chung
- *      (ngày hôm đó đã đủ 18, run sau cron có thể được trigger thủ công)
  *
  * Quota track trong KV: `quota:YYYY-MM-DD:<category>` → số bài đã đăng.
  * TTL 48h (qua ngày tự reset, vẫn lưu phòng debug 1 ngày).
@@ -26,12 +31,12 @@ import type { SourceCategory } from "./sources.js";
 
 // ────────────────────────────────────────────────────────────────────────────
 
-/** Quota mặc định mỗi ngày, tổng = 18. */
+/** Quota mặc định mỗi ngày, tổng = 18 (cap, không phải target — xem comment top file). */
 export const DEFAULT_QUOTA: Record<SourceCategory, number> = {
-  core: 5,
+  core: 6,
   ai: 5,
   dev: 4,
-  research: 2,
+  research: 1,
   trend: 2,
 };
 

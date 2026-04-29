@@ -29,7 +29,7 @@ See the `pnpm-workspace` skill for workspace structure, TypeScript setup, and pa
 
 ## Tech Buzz Daily Bot
 
-Telegram bot that fetches RSS tech news, summarizes with Gemini AI, and posts to `@techbuzz_daily` **mỗi giờ từ 7h sáng tới 0h đêm Việt Nam (18 bài/ngày)**.
+Telegram bot that fetches RSS tech news, summarizes with Gemini AI, and posts to `@techbuzz_daily` **mỗi 2 giờ từ 7h sáng tới 23h đêm Việt Nam (9 bài/ngày max — Phase 15)**. Slot có thể bị skip nếu không có bài score ≥ ngưỡng → ưu tiên CHẤT > LƯỢNG.
 
 ### Cloudflare Workers (PRIMARY — `worker/`)
 
@@ -38,7 +38,7 @@ Deployed to Cloudflare Workers. Migrated từ GitHub Actions vì GH Actions cron
 - **Entry point**: `worker/src/index.ts` (exports `scheduled` + `fetch` handlers)
 - **Modules**: `worker/src/{rss,ai,telegram,storage,sources,url,filter,score,dedup,bucket}.ts`
 - **Tests**: `worker/test/run-tests.ts` — 77 unit tests (URL norm, HTML truncation, og:image, filter, score, dedup, bucket, telegram caption, ai parsing, AI key rotation, per-domain trust)
-- **Config**: `worker/wrangler.toml` — cron `0 0-17 * * *` UTC (= mỗi giờ 7h-0h VN, 18 lần/ngày)
+- **Config**: `worker/wrangler.toml` — cron `0 0,2,4,6,8,10,12,14,16 * * *` UTC (= mỗi 2 giờ 7h-23h VN, **9 lần/ngày**, Phase 15)
 - **Storage**: Cloudflare KV namespace `POSTED_KV`
   - `posted:<sha1(canonical_url)>` — TTL 30 ngày, ngăn dupe URL
   - `title:<sha1(normalized_title)>` — TTL 30 ngày, ngăn dupe title từ URL khác
@@ -56,12 +56,18 @@ Deployed to Cloudflare Workers. Migrated từ GitHub Actions vì GH Actions cron
   - Source health: 21/21 nguồn alive (trước: 14/18). FETCH_TIMEOUT 12s → 18s. MAX_AGE 48h → 30h.
   - Per-domain trust score (`score.ts`): `DOMAIN_TRUST_TABLE` (37 domain, +5..+25 boost) + `BLOCKED_DOMAINS` (19 domain SEO farm, penalty −1000). Suffix match (`news.openai.com` ≈ `openai.com`).
   - `NON_TECH_TITLE_KEYWORDS` mở rộng 11 → 32 từ (chính trị + showbiz + thể thao + lifestyle).
+- **Phase 15 (Apr 2026) — Quality > Quantity**:
+  - **Cron 18→9 tick/ngày** (`wrangler.toml`): mỗi 2h thay vì mỗi giờ. Lý do: 18 bài/ngày bắt bot phải lấp slot bằng candidate score thấp, đồng thời ép Gemini free quota. Mỗi tick có nhiều "ngân sách AI" hơn → ít rủi ro fallback chain bị cạn cùng lúc.
+  - **Min-score gate** (`index.ts`): `MIN_SCORE_THRESHOLD = 220`. Bài score < 220 bị skip; nếu cả batch dưới ngưỡng → slot bỏ trống (log reason `all candidates below MIN_SCORE_THRESHOLD`). KHÔNG fallback xuống bài rác.
+  - **Quota mới** (`bucket.ts`): `core 6 / ai 5 / dev 4 / research 1 / trend 2 = 18` (cap, không phải target). Giảm `research` từ 2→1 để tránh arxiv niche dominate khi nguồn chính ít. Tăng `core` 5→6 bù lại. Vì cron chỉ 9 tick/ngày, cap 18 chỉ kick in khi 1 category có quá nhiều bài ngon.
+  - **Key rotation hướng dẫn user**: nên tạo thêm 1 tài khoản Google + 1 Gemini API key (https://aistudio.google.com/apikey) → set vào CF Workers secret `GOOGLE_API_KEY_1` (Phase 9.2 đã support). Lệnh: `cd worker && wrangler secret put GOOGLE_API_KEY_1`. Có thể thêm `_2`, `_3` ... đến `_5` nếu cần. Mỗi key 1 quota free riêng → bot xoay vòng tự động.
+  - **/top_today endpoint** trả thêm `minScoreThreshold` + `skippedLowScore` để diagnostic.
 - **Pipeline (Phase 1-7 upgrade)**:
   1. Fetch song song 18 nguồn → strict filter cho arxiv (chỉ paper LLM/AI)
   2. Score article: `sourceWeight + recency + keyword(boost-penalty) + primaryLab + engineering + depth − hnPenalty`
   3. Cluster intra-batch (jaccard ≥ 0.80) — winner = source priority thấp hơn
   4. KV check exact (URL + title hash) → fuzzy check (jaccard ≥ 0.88 vs 200 title gần nhất)
-  5. Bucket selection theo quota: `core 5 / ai 5 / dev 4 / research 2 / trend 2 = 18/ngày`; fallback highest score nếu mọi bucket đầy
+  5. **Min-score gate** (Phase 15): bài score < 220 bị skip — thà bỏ slot còn hơn lấp bằng bài rác. Sau đó bucket selection theo quota cap: `core 6 / ai 5 / dev 4 / research 1 / trend 2 = 18` (cap, cron chỉ 9 tick/ngày); fallback highest score nếu mọi bucket đầy
   6. **AI summarize chain (Phase 9 + 9.2)**: `{ title, bullets[], whyItMatters }` — `getProviders(env)` build chain động dựa trên env, dừng ở cái đầu tiên thành công. Thứ tự:
      1. **Gemini 2.5 Flash** (1 provider/key) — quality cao nhất, ưu tiên
      2. **Gemini 2.0 Flash** (1 provider/key) — quota cao hơn, fallback khi 2.5 cạn
@@ -82,6 +88,7 @@ Deployed to Cloudflare Workers. Migrated từ GitHub Actions vì GH Actions cron
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | Token từ @BotFather |
 | `GOOGLE_API_KEY` | Gemini API key (provider 1+2 trong chain) |
+| `GOOGLE_API_KEY_1` … `_5` | **Optional, recommended** — Gemini API key từ tài khoản Google KHÁC (mỗi key 1 quota free riêng). Bot tự xoay vòng (Phase 9.2). Khuyến nghị set ít nhất `_1` để giảm rủi ro cạn quota free tier. |
 | `OPENROUTER_API_KEY` | **Optional** — API key từ openrouter.ai/keys (provider 3+4: Llama/Gemma free). Không set → bot vẫn chạy chỉ với Gemini như cũ. |
 | `RUN_TRIGGER_TOKEN` | Token RIÊNG để bảo vệ endpoint `/run` (KHÔNG dùng chung Telegram token) |
 

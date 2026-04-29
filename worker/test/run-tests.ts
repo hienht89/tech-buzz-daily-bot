@@ -546,8 +546,9 @@ test("bucket.selectFromBuckets: empty candidates → null", () => {
 });
 
 test("bucket.formatUsage: hiện full marker khi đầy", () => {
-  const s = formatUsage({ core: 5, ai: 1, dev: 0, research: 0, trend: 0 });
-  assert.match(s, /core 5\/5\(full\)/);
+  // Quota mặc định Phase 15: core=6 → cần usage=6 để full
+  const s = formatUsage({ core: 6, ai: 1, dev: 0, research: 0, trend: 0 });
+  assert.match(s, /core 6\/6\(full\)/);
   assert.match(s, /ai 1\/5/);
 });
 
