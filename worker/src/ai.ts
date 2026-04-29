@@ -353,7 +353,7 @@ type Provider = {
  * Số lượng tối đa Gemini API key phụ. Tăng nếu cần thêm key (set
  * `GOOGLE_API_KEY_4`, `_5`, ...). Mỗi key tương ứng 1 tài khoản Google.
  */
-const MAX_GEMINI_EXTRA_KEYS = 5;
+const MAX_GEMINI_EXTRA_KEYS = 8;
 
 /**
  * Gom tất cả Gemini API key có sẵn trong env, ưu tiên `GOOGLE_API_KEY` (gốc),
