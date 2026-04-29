@@ -210,12 +210,10 @@ async function sendTextMessage(article: Article, caption: string): Promise<void>
     chat_id: CHAT_ID,
     text: safeTrimEscaped(caption, MAX_MESSAGE_LEN),
     parse_mode: "HTML",
-    link_preview_options: {
-      is_disabled: false,
-      url: article.link,
-      show_above_text: true,
-      prefer_large_media: true,
-    },
+    // TẮT HẲN web preview của Telegram. Caption đã có title VN + nguồn + link.
+    // Nếu để Telegram tự fetch link → preview hiện title + description tiếng
+    // Anh gốc PHÍA TRÊN text Việt → trông như 2 bài chồng nhau.
+    link_preview_options: { is_disabled: true },
   });
 }
 

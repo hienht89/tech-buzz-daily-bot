@@ -283,12 +283,11 @@ async function sendTextMessage(
     chat_id: env.TELEGRAM_CHANNEL_ID,
     text: textForMessage,
     parse_mode: "HTML",
-    link_preview_options: {
-      is_disabled: false,
-      url: article.link,
-      show_above_text: true,
-      prefer_large_media: true,
-    },
+    // TẮT HẲN web preview của Telegram. Lý do: caption mình đã có title VN
+    // (Gen Z), nội dung VN, nguồn, link rồi. Nếu để Telegram tự fetch link
+    // → preview sẽ hiện title + description tiếng Anh gốc của arxiv/wired/...
+    // PHÍA TRÊN text Việt → trông như có 2 bài chồng nhau, rất xấu.
+    link_preview_options: { is_disabled: true },
   });
 }
 
