@@ -58,6 +58,8 @@ const PRIMARY_LAB_SOURCES: ReadonlySet<string> = new Set([
   "Anthropic News",
   "Meta AI Blog",
   "Hugging Face Blog",
+  "NVIDIA Blog",
+  "MIT News AI",
 ]);
 const PRIMARY_LAB_BOOST = 30;
 
@@ -69,6 +71,8 @@ const ENGINEERING_BLOG_SOURCES: ReadonlySet<string> = new Set([
   "Stripe Blog",
   "Cloudflare Blog",
   "Vercel Blog",
+  "Pragmatic Engineer",
+  "Linear Blog",
 ]);
 const ENGINEERING_BLOG_BOOST = 20;
 
@@ -135,6 +139,15 @@ const DOMAIN_TRUST_TABLE: ReadonlyArray<readonly [string, number]> = [
   ["latent.space", 15],
   ["thezvi.substack.com", 10],
   ["interconnects.ai", 10],
+  // Phase 19.9: bổ sung nguồn chất lượng
+  ["technologyreview.com", 20],
+  ["news.mit.edu", 22],
+  ["nvidia.com", 18],
+  ["blogs.nvidia.com", 20],
+  ["newsletter.pragmaticengineer.com", 22],
+  ["pragmaticengineer.com", 18],
+  ["linear.app", 12],
+  ["ycombinator.com", 18],
 ];
 
 /**

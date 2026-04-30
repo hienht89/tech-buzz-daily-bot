@@ -42,12 +42,16 @@ export const RSS_SOURCES: RssSource[] = [
   { name: "Wired",            url: "https://www.wired.com/feed/rss",                   category: "core", priority: 2 },
   { name: "Ars Technica",     url: "https://feeds.arstechnica.com/arstechnica/index",  category: "core", priority: 2 },
   { name: "BBC Technology",   url: "https://feeds.bbci.co.uk/news/technology/rss.xml", category: "core", priority: 2 },
+  { name: "MIT Tech Review",  url: "https://www.technologyreview.com/feed/",           category: "core", priority: 2 },
+  { name: "Y Combinator Blog",url: "https://www.ycombinator.com/blog/rss.xml",         category: "core", priority: 2 },
 
   // ───── AI: labs gốc + paper + commentary ─────
   { name: "OpenAI Blog",       url: "https://openai.com/news/rss.xml",                 category: "ai", priority: 1 },
   { name: "Google AI Blog",    url: "https://blog.google/technology/ai/rss/",          category: "ai", priority: 1 },
   { name: "DeepMind Blog",     url: "https://deepmind.google/blog/rss.xml",            category: "ai", priority: 1 },
   { name: "Hugging Face Blog", url: "https://huggingface.co/blog/feed.xml",            category: "ai", priority: 1 },
+  { name: "NVIDIA Blog",       url: "https://blogs.nvidia.com/feed/",                  category: "ai", priority: 1 },
+  { name: "MIT News AI",       url: "https://news.mit.edu/topic/mitartificial-intelligence2-rss.xml", category: "ai", priority: 1 },
   { name: "Simon Willison",    url: "https://simonwillison.net/atom/everything/",      category: "ai", priority: 2 },
   { name: "Latent Space",      url: "https://www.latent.space/feed",                   category: "ai", priority: 2 },
   { name: "arXiv cs.AI",       url: "http://export.arxiv.org/rss/cs.AI",               category: "ai", priority: 2 },
@@ -59,6 +63,8 @@ export const RSS_SOURCES: RssSource[] = [
   { name: "Stripe Blog",         url: "https://stripe.com/blog/feed.rss",   category: "dev", priority: 1 },
   { name: "Cloudflare Blog",     url: "https://blog.cloudflare.com/rss/",   category: "dev", priority: 1 },
   { name: "Vercel Blog",         url: "https://vercel.com/atom",            category: "dev", priority: 1 },
+  { name: "Pragmatic Engineer", url: "https://newsletter.pragmaticengineer.com/feed", category: "dev", priority: 1 },
+  { name: "Linear Blog",         url: "https://linear.app/rss/blog.xml",    category: "dev", priority: 2 },
   { name: "InfoQ",               url: "https://feed.infoq.com/",            category: "dev", priority: 2 },
   { name: "AWS What's New",      url: "https://aws.amazon.com/about-aws/whats-new/recent/feed/", category: "dev", priority: 2 },
 
