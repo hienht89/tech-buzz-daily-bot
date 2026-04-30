@@ -291,7 +291,7 @@ async function handleQuota(env: Env, chatId: number): Promise<void> {
       .map((r) => {
         const icon = r.ok ? "✅" : "❌";
         const ms = r.ms != null ? `${r.ms}ms` : "?ms";
-        const err = r.error ? ` — ${escapeHtml(r.error.slice(0, 60))}` : "";
+        const err = r.error ? ` — ${escapeHtml(shortError(r.error))}` : "";
         return `${icon} <code>${escapeHtml(r.provider)}</code> ${ms}${err}`;
       })
       .join("\n");
@@ -462,6 +462,37 @@ function escapeHtml(s: string): string {
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
+}
+
+/**
+ * Phase 20.2: rút gọn error string của AI provider thành 1 dòng dễ đọc.
+ * Provider raw error trông như `Gemini gemini-2.5-flash HTTP 429: { "error": { "code": ...`
+ * — slice 60 chars cắt giữa JSON, hiện rất xấu cho user non-tech.
+ *
+ * Logic: ưu tiên detect `HTTP <code>` rồi map sang nhãn tiếng Việt; fallback
+ * detect timeout; cuối cùng fallback truncate plain.
+ */
+function shortError(err: string): string {
+  const httpMatch = err.match(/HTTP (\d{3})/);
+  if (httpMatch) {
+    const code = httpMatch[1];
+    const labels: Record<string, string> = {
+      "401": "key sai",
+      "403": "key bị chặn",
+      "408": "server timeout",
+      "429": "quota cạn",
+      "500": "server lỗi",
+      "502": "bad gateway",
+      "503": "server quá tải",
+      "504": "gateway timeout",
+    };
+    const label = labels[code];
+    return label ? `HTTP ${code} (${label})` : `HTTP ${code}`;
+  }
+  const timeoutMatch = err.match(/timeout (\d+)ms/i);
+  if (timeoutMatch) return `timeout ${timeoutMatch[1]}ms`;
+  if (/timeout/i.test(err)) return "timeout";
+  return err.slice(0, 60);
 }
 
 // Suppress unused import warnings for types intentionally re-imported for docs/IDE.
