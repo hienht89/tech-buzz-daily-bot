@@ -70,6 +70,20 @@ import {
   articleFromJson,
   type QueuePayload,
 } from "./queue.js";
+import {
+  alertQueueLow,
+  alertAiKeysExhausted,
+  alertConsecutivePostFailures,
+  alertRefillFailed,
+  incrementPostFailStreak,
+  resetPostFailStreak,
+  POST_FAIL_ALERT_THRESHOLD,
+} from "./alerts.js";
+import {
+  handleTelegramUpdate,
+  type TelegramUpdate,
+  type AdminCallbacks,
+} from "./admin.js";
 
 export interface Env {
   POSTED_KV: KVNamespace;
@@ -112,6 +126,16 @@ export interface Env {
    * KHÔNG set → tắt mọi cảnh báo. Đặt qua `wrangler secret put TELEGRAM_ADMIN_CHAT_ID`.
    */
   TELEGRAM_ADMIN_CHAT_ID?: string;
+  /**
+   * Phase 20: secret token để verify Telegram webhook.
+   *
+   * Telegram gửi header `X-Telegram-Bot-Api-Secret-Token` mỗi request webhook
+   * (đã set lúc gọi setWebhook). Endpoint /telegram/webhook so sánh với env này
+   * trước khi process update — chống abuse từ public internet (worker URL public).
+   *
+   * KHÔNG set → endpoint /telegram/webhook trả 401 cho mọi request → admin bot tắt.
+   */
+  TELEGRAM_WEBHOOK_SECRET?: string;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1364,6 +1388,53 @@ function isAuthorized(req: Request, env: Env): boolean {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Phase 20: alert hooks (chạy SAU khi cron handler done)
+// ────────────────────────────────────────────────────────────────────────────
+
+/** Ngưỡng queue length sau refill được coi là "ổn". Dưới mức này → alert. */
+const QUEUE_OK_MIN = 6;
+/** Refill failed ≥ ngưỡng này (trong 18 slot) → coi như AI quota đại đa số cạn. */
+const AI_KEY_EXHAUSTED_FAIL_THRESHOLD = 12;
+
+async function checkRefillAlerts(
+  env: Env,
+  r: { runId: string; refilled: number; totalSlots: number; failed: number },
+): Promise<void> {
+  // 1) AI exhausted: nếu refill failed quá nhiều slot → khả năng cao quota AI cạn.
+  if (r.failed >= AI_KEY_EXHAUSTED_FAIL_THRESHOLD) {
+    await alertAiKeysExhausted(env, r.failed, r.totalSlots);
+  }
+  // 2) Queue low: kiểm tra TỔNG queue (kể cả slot từ refill cũ skipped) — nếu
+  // sau refill mà queue vẫn dưới QUEUE_OK_MIN → có thể AI/source yếu.
+  try {
+    const q = await listQueue(env);
+    if (q.length < QUEUE_OK_MIN) {
+      await alertQueueLow(env, q.length, r.refilled, r.totalSlots, r.failed);
+    }
+  } catch (err) {
+    console.warn(
+      `[refill:${r.runId}] Skip queue-low alert (listQueue fail): ` +
+        `${(err as Error).message?.slice(0, 200)}`,
+    );
+  }
+}
+
+async function checkPostAlerts(
+  env: Env,
+  result: { posted: boolean; reason?: string; postedTitle?: string },
+): Promise<void> {
+  if (result.posted) {
+    await resetPostFailStreak(env);
+    return;
+  }
+  // KHÔNG post được — tăng streak. Nếu ≥ ngưỡng → alert (có throttle 6h).
+  const streak = await incrementPostFailStreak(env);
+  if (streak >= POST_FAIL_ALERT_THRESHOLD) {
+    await alertConsecutivePostFailures(env, streak, result.reason ?? "no reason");
+  }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Worker entry
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -1386,14 +1457,18 @@ export default {
     if (REFILL_CRON_EXPRS.has(controller.cron)) {
       ctx.waitUntil(
         runQueueRefill(env)
-          .then((r) => {
+          .then(async (r) => {
             console.log(
               `[refill:${r.runId}] Cron refill done. refilled=${r.refilled}/${r.totalSlots} ` +
                 `skippedExisting=${r.skippedExisting} failed=${r.failed}` +
                 (r.reason ? ` reason="${r.reason}"` : ""),
             );
+            await checkRefillAlerts(env, r);
           })
-          .catch((err) => console.error("[bot] FATAL (refill cron):", err)),
+          .catch(async (err) => {
+            console.error("[bot] FATAL (refill cron):", err);
+            await alertRefillFailed(env, (err as Error).message ?? "unknown");
+          }),
       );
       return;
     }
@@ -1402,7 +1477,7 @@ export default {
     const slotDate = currentHourSlot(scheduledTime);
     ctx.waitUntil(
       runQueuePost(env, slotDate)
-        .then((result) => {
+        .then(async (result) => {
           console.log(
             `[bot:${result.runId}] Post cron done. posted=${result.posted} ` +
               `attempted=${result.attempted}` +
@@ -1412,8 +1487,19 @@ export default {
                 ? ` kvWrites=${result.kvWrites.filter((k) => k.ok).length}/${result.kvWrites.length}`
                 : ""),
           );
+          await checkPostAlerts(env, result);
         })
-        .catch((err) => console.error("[bot] FATAL (post cron):", err)),
+        .catch(async (err) => {
+          console.error("[bot] FATAL (post cron):", err);
+          const streak = await incrementPostFailStreak(env);
+          if (streak >= POST_FAIL_ALERT_THRESHOLD) {
+            await alertConsecutivePostFailures(
+              env,
+              streak,
+              `[FATAL] ${(err as Error).message ?? "unknown"}`,
+            );
+          }
+        }),
     );
   },
 
@@ -1832,6 +1918,100 @@ export default {
       );
     }
 
+    // ───── /telegram/setup: Phase 20 — đăng ký webhook với Telegram ─────
+    // Bearer-auth, gọi Telegram Bot API setWebhook để trỏ webhook tới worker này.
+    // URL = "<origin>/telegram/webhook", secret_token = env.TELEGRAM_WEBHOOK_SECRET.
+    // Idempotent — gọi nhiều lần OK (Telegram chỉ overwrite registration cũ).
+    if (url.pathname === "/telegram/setup") {
+      if (req.method !== "POST") {
+        return new Response("Method Not Allowed. Use POST.\n", {
+          status: 405,
+          headers: { Allow: "POST" },
+        });
+      }
+      if (!isAuthorized(req, env)) {
+        return new Response("Unauthorized\n", { status: 401 });
+      }
+      if (!env.TELEGRAM_WEBHOOK_SECRET) {
+        return new Response(
+          "TELEGRAM_WEBHOOK_SECRET chưa set. Chạy `wrangler secret put TELEGRAM_WEBHOOK_SECRET` trước.\n",
+          { status: 400 },
+        );
+      }
+      const webhookUrl = `${url.origin}/telegram/webhook`;
+      try {
+        const tgRes = await fetch(
+          `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              url: webhookUrl,
+              secret_token: env.TELEGRAM_WEBHOOK_SECRET,
+              allowed_updates: ["message"],
+              drop_pending_updates: true,
+            }),
+          },
+        );
+        const body = (await tgRes.json()) as Record<string, unknown>;
+        return new Response(
+          JSON.stringify({ webhookUrl, telegramResponse: body }, null, 2),
+          {
+            status: tgRes.ok ? 200 : 502,
+            headers: { "Content-Type": "application/json" },
+          },
+        );
+      } catch (err) {
+        return new Response(
+          JSON.stringify({ error: (err as Error).message }, null, 2),
+          { status: 500, headers: { "Content-Type": "application/json" } },
+        );
+      }
+    }
+
+    // ───── /telegram/webhook: Phase 20 admin bot (Telegram secret token verify) ─────
+    if (url.pathname === "/telegram/webhook") {
+      if (req.method !== "POST") {
+        return new Response("Method Not Allowed. Use POST.\n", {
+          status: 405,
+          headers: { Allow: "POST" },
+        });
+      }
+      const expectedSecret = env.TELEGRAM_WEBHOOK_SECRET?.trim();
+      if (!expectedSecret) {
+        // Endpoint tắt nếu chưa cấu hình — tránh leak nội bộ.
+        return new Response("Webhook not configured\n", { status: 401 });
+      }
+      const got = req.headers.get("X-Telegram-Bot-Api-Secret-Token") ?? "";
+      if (!timingSafeEqual(got, expectedSecret)) {
+        return new Response("Forbidden\n", { status: 403 });
+      }
+      let update: TelegramUpdate;
+      try {
+        update = (await req.json()) as TelegramUpdate;
+      } catch (err) {
+        console.error(
+          `[telegram/webhook] Invalid JSON body: ${(err as Error).message?.slice(0, 200)}`,
+        );
+        // Trả 200 dù body parse fail → Telegram không retry update hỏng vô tận.
+        return new Response("OK\n", { status: 200 });
+      }
+      const callbacks: AdminCallbacks = {
+        triggerRefill: () => runQueueRefill(env),
+      };
+      // Run handler async; ack Telegram ngay với 200 để tránh webhook timeout.
+      // handleTelegramUpdate đã no-throw nội bộ, nhưng wrap thêm catch ở đây
+      // để chắc chắn waitUntil không nuốt lỗi vào console.
+      ctx.waitUntil(
+        handleTelegramUpdate(env, update, ctx, callbacks).catch((err) =>
+          console.error(
+            `[telegram/webhook] Handler crashed: ${(err as Error).message?.slice(0, 300)}`,
+          ),
+        ),
+      );
+      return new Response("OK\n", { status: 200 });
+    }
+
     return new Response(
       "Tech Buzz Daily bot worker.\n" +
         "Endpoints (Bearer = cần Authorization: Bearer <RUN_TRIGGER_TOKEN>):\n" +
@@ -1840,6 +2020,7 @@ export default {
         "  POST /run?dry=1 (Bearer)      — dry-run, trả về candidate sẽ chọn (KHÔNG post)\n" +
         "  POST /force_fetch (Bearer)    — alias của /run\n" +
         "  POST /refill (Bearer)         — Phase 19.8: tóm tắt sẵn 18 bài cho 18 slot kế tiếp (async)\n" +
+        "  POST /telegram/webhook        — Phase 20: Telegram admin bot (secret-token header)\n" +
         "  GET  /queue     (Bearer)      — Phase 19.8: list slot đã queue (slot, title, provider, age)\n" +
         "  GET  /sources   (Bearer)      — source health report\n" +
         "  GET  /stats     (Bearer)      — bucket usage hôm nay + threshold động (Task 7) + recent titles\n" +

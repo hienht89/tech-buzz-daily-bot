@@ -70,6 +70,35 @@ Deployed to Cloudflare Workers. Migrated từ GitHub Actions vì GH Actions cron
   - **`runBot` ghi `lastAiError` vào `RunResult.reason`**: dry-run / `/run` giờ lộ message thực của provider cuối (không cần `wrangler tail`).
   - **`/top_today` thêm `topPreGate`**: top 10 bài có score cao nhất TRƯỚC khi qua MIN_SCORE_THRESHOLD + KV check → nhìn được score thực tế của batch hiện tại.
   - **Endpoint MỚI `/diag_ai`** (cần Bearer): probe từng AI provider trên 1 article giả, KHÔNG chạm KV/Telegram/RSS. Trả `{provider, ok, ms, error}` cho từng cái — chẩn đoán "provider nào sống/chết" trong 1 request.
+- **Phase 20 (Apr 30, 2026) — Telegram Admin Bot + Proactive Alerts**:
+  - **Yêu cầu user**: quản lý bot từ điện thoại (không phải mở browser/curl), bot tự cảnh báo khi có sự cố. Dùng chung 1 bot @techbuzz_daily (không tạo bot mới) — token cũ đã có quyền sendMessage, chỉ cần thêm webhook receive update.
+  - **Files mới**: `worker/src/admin.ts` (~470 lines, command router), `worker/src/alerts.ts` (~210 lines, throttled alert helpers).
+  - **Endpoints mới** (index.ts):
+    - `POST /telegram/webhook` — Telegram → bot. Verify header `X-Telegram-Bot-Api-Secret-Token` = `env.TELEGRAM_WEBHOOK_SECRET` (timing-safe). Parse update, ack 200 ngay, run handler async qua `ctx.waitUntil` (tránh Telegram retry timeout).
+    - `POST /telegram/setup` (Bearer) — gọi Telegram setWebhook trỏ về `<origin>/telegram/webhook` với secret_token. Idempotent, gọi lại OK.
+  - **Authorize**: chỉ `message.chat.id === env.TELEGRAM_ADMIN_CHAT_ID` mới process; chat khác silent ignore (không leak bot existence). Webhook secret + admin chat ID đều set qua wrangler secret.
+  - **Commands**: `/start`, `/help` — menu; `/queue` — list 18 slot (giờ VN, source, title, age); `/sources` — fetch 27 RSS, list dead + top OK (slow ~5-10s, ack first); `/quota` — probe 9+ AI providers (slow ~10-30s, ack first); `/refill` — trigger refill async qua callback `triggerRefill`; `/clear_queue YES` — xoá toàn bộ slot (yêu cầu xác nhận "YES"); `/skip <giờ>` — xoá slot giờ VN cụ thể (vd `/skip 14` = bỏ 14h hôm nay UTC 7h); `/stats` — bucket usage hôm nay + queue len + last posted; `/health` — KV roundtrip probe.
+  - **Alerts proactive (4 loại, throttle 6h/loại qua KV TTL)**:
+    1. `alertQueueLow` — sau refill nếu `listQueue().length < QUEUE_OK_MIN=6`.
+    2. `alertAiKeysExhausted` — refill `failed >= AI_KEY_EXHAUSTED_FAIL_THRESHOLD=12` (2/3 of 18 slots).
+    3. `alertConsecutivePostFailures` — post fail liên tiếp `>= POST_FAIL_ALERT_THRESHOLD=3` (KV counter `alert:postfail:streak`, reset on success).
+    4. `alertRefillFailed` — refill cron throw exception (catch block trong scheduled handler).
+  - **Hooks**: scheduled handler refill `.then(checkRefillAlerts)` + `.catch(alertRefillFailed)`; post `.then(checkPostAlerts)` + `.catch(incrementPostFailStreak + alert)`.
+  - **Throttle implementation**: `alerts.ts` `sendThrottledAlert(env, type, text)` — KV key `alert:throttle:<type>` với TTL 6h. Read → skip if exists. Write after sendAdminAlert success. Lỗi KV → vẫn cố gửi (no-throw, log warn).
+  - **Secrets mới**: `TELEGRAM_ADMIN_CHAT_ID = 5787008349` (DM Telegram của user, lấy từ @userinfobot), `TELEGRAM_WEBHOOK_SECRET` (random hex 48 chars, generate `openssl rand -hex 24`).
+  - **Setup flow**: (1) `wrangler secret put TELEGRAM_ADMIN_CHAT_ID`, (2) `wrangler secret put TELEGRAM_WEBHOOK_SECRET`, (3) `wrangler deploy`, (4) `curl -X POST -H "Bearer ..." /telegram/setup` — Telegram trả `{ok: true, "Webhook was set"}`.
+  - **Performance**: webhook handler ack 200 ngay (<200ms). Slow commands (sources/quota/refill) reply "Đang xử lý..." trước, kết quả gửi qua second message khi done — Telegram không timeout webhook.
+  - **Verify deploy `f51f614b`**: tests 156/156 pass; webhook setWebhook OK; user gửi /start nhận menu.
+- **Phase 19.9 (Apr 30, 2026) — Refill ngoài khung post + cap 2 bài/nguồn**:
+  - **Vấn đề user nêu (1)**: refill cron 06:30/35/40 UTC = 13:30 chiều VN, RƠI vào khung post (UTC 0-17 = 7h sáng → 0h khuya VN) → 2 cron có thể chạy đan xen, share AI quota. **Vấn đề (2)**: queue có thể có 3-4 bài cùng nguồn liên tiếp (vd 3× AWS, 4× Wired) — không đa dạng.
+  - **Fix (1)**: `wrangler.toml` cron đổi `"30/35/40 6 * * *"` → `["0 22 * * *", "5 22 * * *", "10 22 * * *"]` = 5h00/05/10 sáng VN. Khung không-post là UTC 18:00-23:59 (= 1h-7h sáng VN); chọn UTC 22 để có 2h đệm trước cron post đầu (UTC 0:00 = 7h sáng VN). `index.ts` `REFILL_CRON_EXPRS` Set update theo. Trade-off: mất "Mỹ giờ làm" boost (UTC 22 = 14h PT) nhưng quota Gemini per-key nên không bị share đáng kể.
+  - **Fix (2)**: `runQueueRefill` thêm const `MAX_PER_SOURCE_QUEUE = 2`. Init `queuedSourceCount` Map từ `listQueue()` loop. Sau `interleaveByCategory` ordering, loop qua `ordered` candidates: nếu `queuedSourceCount.get(source) >= 2` → skip, else push vào `capped[]` + tăng counter. `primaries = capped.slice(0, slotsToFill)`, `fallbackPool = capped.slice(slotsToFill)`. Log mỗi refill: `Per-source cap: skipped X candidates`.
+  - **Test**: 156/156 pass; rename test "refill từ 06:30 UTC" → "refill từ giữa khung post" (timestamp vẫn dùng làm sample math, không tied to cron value).
+  - **Verify deploy `2d9d3ba2`**: typecheck clean, schedule mới `0 0-17 * * *` + 3× `_ 22 * * *` đăng ký OK với Cloudflare.
+- **Phase 19.8.1 (Apr 30, 2026) — Mở rộng pool nguồn từ 21 → 27 + tăng trust score**:
+  - 6 nguồn mới: MIT Tech Review, Y Combinator Blog, NVIDIA Blog, MIT News AI, Pragmatic Engineer, Linear Blog. DOMAIN_TRUST_TABLE +12..+22 cho các nguồn tier-1. NVIDIA/MIT News AI vào PRIMARY_LAB_SOURCES, Pragmatic/Linear vào ENGINEERING_BLOG_SOURCES.
+  - Verify dead: Anthropic, Mistral, OpenAI Research (404), Microsoft AI (403). Loại Engadget/9to5Google/MacRumors/Smashing/Sequoia/VentureBeat/Crunchbase do consumer/business focus.
+  - Set Gemini key thứ 9 (`GOOGLE_API_KEY_8`) qua wrangler secret put — quota hồi, refill seed 12+ slot OK. Deploy `0043917c`.
 - **Phase 19.8 (Apr 30, 2026) — Queue-based pre-generated scheduling (Hướng C)**:
   - **Vấn đề user nêu**: post tick `0 0-17 * * *` chạy lúc người Mỹ peak hours (UTC 13-17 = giờ làm việc EST/PST). AI providers (Gemini free tier) bị share traffic → 429 cao, miss slot. User chốt Hướng C: refill queue lúc Mỹ ngủ (06:30 UTC = ~22:30 PT), post tick chỉ đọc queue.
   - **Architecture**: `worker/src/queue.ts` — KV slot key `queue:YYYY-MM-DDTHH` UTC, TTL 36h. API: `slotKeyForUTC`, `enumerateNextPostSlots`, `peekSlot`, `enqueueSlot`, `dequeueSlot`, `clearSlot`, `listQueue`, `articleToJson`/`articleFromJson`.
