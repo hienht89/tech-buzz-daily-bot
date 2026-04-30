@@ -48,7 +48,16 @@ function buildSignatureLine(env: Env): string {
 }
 
 /**
- * Format caption với smart truncation cho schema mới (bullets + whyItMatters):
+ * Phase 19.7 (bilingual hybrid): brand hashtag auto-append cho mọi caption
+ * có hashtag. Đảm bảo discovery + branding consistency. Không append nếu AI
+ * đã có sẵn (case-insensitive dedupe).
+ */
+const BRAND_HASHTAG = "TechBuzzDaily";
+const MAX_HASHTAGS_RENDERED = 5;
+const SEPARATOR_LINE = "━━━━━━━━━━";
+
+/**
+ * Format caption với smart truncation cho schema bilingual hybrid (Phase 19.7):
  *
  *   <b>title</b>
  *
@@ -58,15 +67,23 @@ function buildSignatureLine(env: Env): string {
  *
  *   💡 <b>Vì sao đáng đọc:</b> whyItMatters
  *
+ *   ━━━━━━━━━━
+ *   🌐 <i>EN:</i> enTldr                  ← optional, Phase 19.7
+ *
  *   🔗 <a href="article.link">article.link</a>
  *
  *   — 🐝 <b>Tech Buzz Daily</b> · @techbuzz_daily
  *
- * Quy tắc cắt:
- * - Title / "Vì sao đáng đọc" / link / signature giữ nguyên vẹn.
- * - Cắt theo thứ tự ưu tiên (cuối → đầu): bỏ bullet cuối cùng, rồi cắt
- *   bullet còn lại bằng truncateRawByEscapedBudget.
- * - Nếu fixed parts đã vượt budget → cắt link text (giữ href).
+ *   #AI #OpenAI #TechBuzzDaily            ← optional, Phase 19.7
+ *
+ * Quy tắc cắt (priority cao → thấp khi caption tràn budget):
+ * 1. Drop hashtag line (chỉ là discovery aid, không mất nội dung).
+ * 2. Drop EN section (separator + EN line) — người Việt vẫn đọc được full.
+ * 3. Cắt bullets từ cuối (existing behavior).
+ * 4. Last resort: cắt link text giữ href.
+ *
+ * Backward compat: nếu enTldr rỗng (provider trả schema cũ) → skip section
+ * EN tự động, không cần check ở caller.
  */
 function formatCaption(
   article: Article,
@@ -77,6 +94,8 @@ function formatCaption(
   // Hard cap raw text trước khi escape, tránh Gemini trả về quá dài.
   const rawTitle = summary.title.slice(0, 150);
   const rawWhy = summary.whyItMatters.slice(0, 320);
+  const rawEnTldr = (summary.enTldr ?? "").trim().slice(0, 200);
+  const renderedHashtags = buildHashtagList(summary.hashtags ?? []);
 
   const title = escapeHtml(rawTitle);
   const why = escapeHtml(rawWhy);
@@ -86,42 +105,115 @@ function formatCaption(
   const titleLine = `<b>${title}</b>`;
   const whyLine = `💡 <b>Vì sao đáng đọc:</b> ${why}`;
   const signatureLine = buildSignatureLine(env);
-
-  // 4 separator (mỗi cái 2 newline) = 8 chars khoảng cách
-  const SEP_LEN = 8;
-
   let linkLine = `🔗 <a href="${linkHref}">${linkText}</a>`;
-  let fixedLen =
-    titleLine.length + whyLine.length + linkLine.length + signatureLine.length + SEP_LEN;
 
-  // Nếu fixed parts đã vượt → cắt link TEXT (giữ href nguyên vẹn)
-  if (fixedLen >= maxLen - 30) {
+  // Optional sections (rỗng nếu không có data)
+  const enBlock = rawEnTldr
+    ? `${SEPARATOR_LINE}\n🌐 <i>EN:</i> ${escapeHtml(rawEnTldr)}`
+    : "";
+  const hashtagLine = renderedHashtags.length > 0
+    ? renderedHashtags.map((h) => "#" + h).join(" ")
+    : "";
+
+  // Layout sections joined by "\n\n":
+  //   [title, bullets?, why, enBlock?, link, signature, hashtagLine?]
+  // Mỗi gap "\n\n" = 2 chars. Tổng gaps = (số section) - 1.
+  const MIN_BULLETS_BUDGET = 30;
+
+  // computeBulletsBudget: tính budget RAW còn lại cho bullets section
+  // (đã trừ tất cả fixed sections + gaps), giả định bullets có mặt.
+  const computeBulletsBudget = (includeEn: boolean, includeHashtag: boolean): number => {
+    let len = titleLine.length + whyLine.length + linkLine.length + signatureLine.length;
+    let sectionCount = 4; // title, why, link, signature
+    if (includeEn && enBlock) {
+      len += enBlock.length;
+      sectionCount += 1;
+    }
+    if (includeHashtag && hashtagLine) {
+      len += hashtagLine.length;
+      sectionCount += 1;
+    }
+    // Bullets section thêm 1 → tổng sections = sectionCount + 1, gaps = sectionCount.
+    const gaps = sectionCount * 2;
+    return maxLen - len - gaps;
+  };
+
+  // Try full layout, drop optional sections theo priority nếu thiếu chỗ.
+  let useEn = enBlock.length > 0;
+  let useHashtag = hashtagLine.length > 0;
+  let bulletsBudget = computeBulletsBudget(useEn, useHashtag);
+
+  if (bulletsBudget < MIN_BULLETS_BUDGET && useHashtag) {
+    useHashtag = false;
+    bulletsBudget = computeBulletsBudget(useEn, false);
+  }
+  if (bulletsBudget < MIN_BULLETS_BUDGET && useEn) {
+    useEn = false;
+    bulletsBudget = computeBulletsBudget(false, false);
+  }
+
+  // Last resort: nếu fixed parts (title + why + link + signature) đã quá lớn
+  // → cắt link TEXT (giữ href nguyên). Chỉ áp dụng khi đã drop hết optional.
+  if (bulletsBudget < MIN_BULLETS_BUDGET) {
     const overhead =
       titleLine.length +
       whyLine.length +
       signatureLine.length +
-      SEP_LEN +
+      8 + // 4 gaps × 2 chars
       `🔗 <a href="${linkHref}"></a>`.length +
       30;
     const linkBudget = maxLen - overhead;
     if (linkBudget > 20 && linkText.length > linkBudget) {
       linkText = linkText.slice(0, linkBudget - 3) + "...";
       linkLine = `🔗 <a href="${linkHref}">${linkText}</a>`;
-      fixedLen =
-        titleLine.length + whyLine.length + linkLine.length + signatureLine.length + SEP_LEN;
+      bulletsBudget = computeBulletsBudget(false, false);
     }
   }
 
-  // Budget còn lại cho phần bullets (RAW, chưa escape)
-  const bulletsBudget = maxLen - fixedLen;
   const bulletsRendered = renderBullets(summary.bullets, bulletsBudget);
 
-  if (!bulletsRendered) {
-    // Cực hiếm: không đủ chỗ cho bullet nào → ghép phần còn lại
-    return [titleLine, "", whyLine, "", linkLine, "", signatureLine].join("\n");
-  }
+  // Assemble final caption (skip empty sections để không có "\n\n\n" thừa).
+  const parts: string[] = [titleLine];
+  if (bulletsRendered) parts.push(bulletsRendered);
+  parts.push(whyLine);
+  if (useEn && enBlock) parts.push(enBlock);
+  parts.push(linkLine);
+  parts.push(signatureLine);
+  if (useHashtag && hashtagLine) parts.push(hashtagLine);
 
-  return [titleLine, "", bulletsRendered, "", whyLine, "", linkLine, "", signatureLine].join("\n");
+  return parts.join("\n\n");
+}
+
+/**
+ * Phase 19.7: build danh sách hashtag CUỐI CÙNG để render (đã sanitize ở
+ * tầng AI parse — xem `sanitizeRawHashtags` trong ai.ts).
+ *
+ * Logic:
+ * - Lấy max 4 hashtag đầu từ AI (giữ chỗ cho brand hashtag).
+ * - Auto-append `TechBuzzDaily` nếu chưa có (case-insensitive dedupe).
+ * - Cap tổng cộng 5 hashtag (Telegram caption tight, > 5 trông spam).
+ *
+ * Không escape ở đây vì hashtag đã enforce alphanumeric ASCII tại
+ * sanitizeRawHashtags → không có ký tự HTML cần escape.
+ */
+function buildHashtagList(rawFromAi: readonly string[]): string[] {
+  const out: string[] = [];
+  for (const h of rawFromAi) {
+    if (typeof h !== "string" || h.length === 0) continue;
+    if (out.some((existing) => existing.toLowerCase() === h.toLowerCase())) continue;
+    out.push(h);
+    if (out.length >= MAX_HASHTAGS_RENDERED - 1) break; // chừa 1 slot cho brand
+  }
+  // Phase 19.7: chỉ append brand khi AI có trả ≥1 hashtag — tránh hiển thị
+  // hashtag "#TechBuzzDaily" đơn độc khi backward compat schema cũ trả [].
+  // Khi AI mới có hashtag, brand luôn được append (case-insensitive dedupe
+  // phòng AI tự thêm "TechBuzzDaily" vào).
+  if (out.length === 0) return [];
+  const hasBrand = out.some((h) => h.toLowerCase() === BRAND_HASHTAG.toLowerCase());
+  if (!hasBrand && out.length < MAX_HASHTAGS_RENDERED) {
+    out.push(BRAND_HASHTAG);
+  }
+  return out;
 }
 
 /**
@@ -328,6 +420,7 @@ const MAX_MESSAGE_LEN = 4096;
  */
 export const __test = {
   formatCaption,
+  buildHashtagList,
 };
 
 async function sendTextMessage(

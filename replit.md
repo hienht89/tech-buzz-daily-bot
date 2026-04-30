@@ -70,6 +70,19 @@ Deployed to Cloudflare Workers. Migrated từ GitHub Actions vì GH Actions cron
   - **`runBot` ghi `lastAiError` vào `RunResult.reason`**: dry-run / `/run` giờ lộ message thực của provider cuối (không cần `wrangler tail`).
   - **`/top_today` thêm `topPreGate`**: top 10 bài có score cao nhất TRƯỚC khi qua MIN_SCORE_THRESHOLD + KV check → nhìn được score thực tế của batch hiện tại.
   - **Endpoint MỚI `/diag_ai`** (cần Bearer): probe từng AI provider trên 1 article giả, KHÔNG chạm KV/Telegram/RSS. Trả `{provider, ok, ms, error}` cho từng cái — chẩn đoán "provider nào sống/chết" trong 1 request.
+- **Phase 19.7 (Apr 30, 2026) — Bilingual hybrid: kênh phục vụ cả người VN + người nước ngoài**:
+  - **Yêu cầu user**: kênh @techbuzz_daily không chỉ cho người Việt mà cả người nước ngoài đọc được. User chốt **Hướng 3 (hybrid nhẹ)** sau khi mình tư vấn 3 hướng — giữ 1 channel, content VN làm chính, thêm 1 dòng EN TL;DR + hashtag EN cuối caption. Lý do: brand "Tech Buzz Daily" sẵn EN, source RSS đã EN nên không cần dịch ngược (cost AI minimal), kênh đang xây audience không nên chia 2, user non-tech khó maintain 2 channel.
+  - **Schema mới**: `Summary` thêm 2 field optional `enTldr` (1 câu English ≤200 chars, neutral journalistic tone) + `hashtags` (string[] alphanumeric ASCII, sanitize qua `sanitizeRawHashtags`). Backward compat: schema cũ thiếu 2 field → empty string/array, formatCaption tự skip section.
+  - **Prompt AI** (`worker/src/ai.ts`): yêu cầu Gemini sinh thêm `enTldr` + `hashtags` trong cùng JSON response (không tăng số API call, chỉ tăng input/output tokens nhẹ). Quy tắc: enTldr KHÔNG emoji/Việt, neutral tone; hashtags 3-5 từ keyword chính bài, alphanumeric only.
+  - **Format caption mới** (`worker/src/telegram.ts` `formatCaption`): thêm separator `━━━━━━━━━━` + `🌐 <i>EN:</i> {enTldr}` sau `whyItMatters`, hashtag line cuối cùng (sau signature). Brand hashtag `#TechBuzzDaily` auto-append (case-insensitive dedupe) — nhưng CHỈ khi AI có ≥1 hashtag (tránh hiện brand đơn độc khi backward compat).
+  - **Smart truncation** priority (drop từ thấp → cao khi tràn 1024 char cap):
+    1. Drop hashtag line trước (chỉ là discovery aid).
+    2. Drop EN section (separator + EN line) — người Việt vẫn đọc đủ.
+    3. Cắt bullets từ cuối (existing).
+    4. Last resort: cắt link text giữ href.
+  - **Verify deploy `5cb62e0d`**: trigger manual lúc 03:41 UTC → bot post bài "👻 GPT-5 bị 'ma ám'? OpenAI giải mã mấy cái quirk tính cách siêu dị của AI!" (provider gemini-2.5-flash#k2, score 259, category ai). totalToday 5→6.
+  - **Test**: 142/142 pass (+9 test mới: render full layout, backward compat, drop hashtag tight, drop both rất tight, buildHashtagList với brand append + dedupe + cap 5, sanitizeRawHashtags với 6 case).
+  - **KHÔNG đổi**: cron schedule (vẫn `0 0-17 * * *` Phase 19.6), bucket quota, scoring, AI provider chain, threshold logic.
 - **Phase 19.6 (Apr 30, 2026) — Always-post: 18 bài/ngày guarantee, không miss slot**:
   - **Yêu cầu user**: bot phải post ĐÚNG 18 bài/ngày từ 7h sáng đến 0h khuya VN, không miss slot nào, đăng đúng giờ. Philosophical shift từ "thà skip còn hơn post rác" → "luôn post bài tốt nhất hiện có".
   - **3 thay đổi đồng thời**:

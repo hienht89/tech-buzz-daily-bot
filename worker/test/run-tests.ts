@@ -823,6 +823,136 @@ test("telegram.formatCaption: HTML escape trong title bullet why", () => {
 });
 
 // ────────────────────────────────────────────────────────────────────────────
+// Phase 19.7: bilingual hybrid — EN TL;DR + hashtags (caption + parser)
+// ────────────────────────────────────────────────────────────────────────────
+
+test("telegram.formatCaption Phase 19.7: render EN section + hashtag line", () => {
+  const article = mkArticle({ link: "https://example.com/post" });
+  const summary = {
+    title: "🚀 GPT-5 ra mắt",
+    bullets: ["Context 10M tokens", "Reasoning tốt hơn 30%"],
+    whyItMatters: "Đặt chuẩn mới cho LLM.",
+    enTldr: "OpenAI launches GPT-5 with 10M token context and 30% better reasoning.",
+    hashtags: ["AI", "OpenAI", "GPT5"],
+  };
+  const env = { TELEGRAM_CHANNEL_ID: "@techbuzz_daily" } as any;
+  const out = telegramTest.formatCaption(article, summary, env, 1024);
+  // VN content vẫn đầy đủ
+  assert.match(out, /<b>🚀 GPT-5 ra mắt<\/b>/);
+  assert.match(out, /• Context 10M tokens/);
+  assert.match(out, /Vì sao đáng đọc:/);
+  // EN section
+  assert.match(out, /━━━━━━━━━━/);
+  assert.match(out, /🌐 <i>EN:<\/i> OpenAI launches GPT-5/);
+  // Hashtag line — 3 từ AI + brand auto-append
+  assert.match(out, /#AI #OpenAI #GPT5 #TechBuzzDaily/);
+  // Order: title → bullets → why → enBlock → link → signature → hashtag
+  const titlePos = out.indexOf("<b>🚀");
+  const bulletsPos = out.indexOf("• Context");
+  const whyPos = out.indexOf("Vì sao");
+  const enPos = out.indexOf("🌐");
+  const linkPos = out.indexOf("🔗");
+  const sigPos = out.indexOf("Tech Buzz Daily</b>");
+  const hashtagPos = out.indexOf("#AI");
+  assert.ok(
+    titlePos < bulletsPos && bulletsPos < whyPos && whyPos < enPos &&
+      enPos < linkPos && linkPos < sigPos && sigPos < hashtagPos,
+    "thứ tự sections sai",
+  );
+});
+
+test("telegram.formatCaption Phase 19.7: backward compat — không có enTldr/hashtags → format cũ", () => {
+  const article = mkArticle({ link: "https://example.com/p" });
+  const summary = {
+    title: "T",
+    bullets: ["b1"],
+    whyItMatters: "w",
+    // enTldr + hashtags undefined → schema cũ
+  };
+  const env = { TELEGRAM_CHANNEL_ID: "@x" } as any;
+  const out = telegramTest.formatCaption(article, summary, env, 1024);
+  assert.ok(!out.includes("━━━"), "không được render separator khi không có EN");
+  assert.ok(!out.includes("🌐"), "không được render EN line khi enTldr rỗng");
+  assert.ok(!out.includes("#"), "không được render hashtag khi hashtags rỗng");
+});
+
+test("telegram.formatCaption Phase 19.7: enTldr rỗng nhưng hashtags có → vẫn render hashtag", () => {
+  const article = mkArticle({ link: "https://example.com/p" });
+  const summary = {
+    title: "T",
+    bullets: ["b1"],
+    whyItMatters: "w",
+    enTldr: "",
+    hashtags: ["AI"],
+  };
+  const env = { TELEGRAM_CHANNEL_ID: "@x" } as any;
+  const out = telegramTest.formatCaption(article, summary, env, 1024);
+  assert.ok(!out.includes("🌐"));
+  assert.match(out, /#AI #TechBuzzDaily/);
+});
+
+test("telegram.formatCaption Phase 19.7: caption tight → drop hashtag trước, giữ EN", () => {
+  // Dùng env KHÔNG có @handle để signature ngắn (~27 chars), dễ tính toán.
+  // Fixed parts: title 87 + why 175 + link 60 + sig 27 = 349
+  // + EN block (~47), + hashtag line (~49)
+  // maxLen=460 → drop hashtag (vượt 30 char budget cho bullets), giữ EN.
+  const article = mkArticle({ link: "https://example.com/p" });
+  const summary = {
+    title: "T".repeat(80),
+    bullets: ["bullet"],
+    whyItMatters: "W".repeat(150),
+    enTldr: "Short EN summary here.",
+    hashtags: ["AI", "OpenAI", "GPT5", "MachineLearning"],
+  };
+  const env = { TELEGRAM_CHANNEL_ID: "" } as any; // signature không link handle
+  const out = telegramTest.formatCaption(article, summary, env, 460);
+  assert.ok(out.length <= 460, `caption ${out.length} vượt 460`);
+  assert.ok(!out.includes("#AI"), `hashtag phải bị drop, got len=${out.length}: ${out}`);
+  assert.match(out, /🌐 <i>EN:<\/i> Short EN summary/);
+});
+
+test("telegram.formatCaption Phase 19.7: caption rất tight → drop cả EN + hashtag", () => {
+  // Dùng env KHÔNG có @handle. Cùng setup nhưng maxLen tight hơn.
+  // Fixed parts: 349. + EN(47)+gap(2)=396 → cần budget bullets ≥30 → maxLen≥436.
+  // maxLen=410 → kể cả không EN/hashtag, bullets budget = 410-349-8 = 53 ≥ 30 ✓
+  // Nhưng +EN: 410-396-10 = 4 < 30 → drop EN.
+  const article = mkArticle({ link: "https://example.com/p" });
+  const summary = {
+    title: "T".repeat(80),
+    bullets: ["bullet"],
+    whyItMatters: "W".repeat(150),
+    enTldr: "EN summary text content here.",
+    hashtags: ["AI", "OpenAI"],
+  };
+  const env = { TELEGRAM_CHANNEL_ID: "" } as any;
+  const out = telegramTest.formatCaption(article, summary, env, 410);
+  assert.ok(out.length <= 410, `caption ${out.length} vượt 410`);
+  assert.ok(!out.includes("#AI"));
+  assert.ok(!out.includes("🌐"));
+  assert.ok(!out.includes("━━━"));
+});
+
+test("telegram.buildHashtagList: brand auto-append + dedupe case-insensitive", () => {
+  // Case 1: AI không có brand → append
+  assert.deepEqual(
+    telegramTest.buildHashtagList(["AI", "OpenAI"]),
+    ["AI", "OpenAI", "TechBuzzDaily"],
+  );
+  // Case 2: AI có brand sẵn (lowercase) → không double-append
+  assert.deepEqual(
+    telegramTest.buildHashtagList(["AI", "techbuzzdaily"]),
+    ["AI", "techbuzzdaily"],
+  );
+  // Case 3: Quá nhiều hashtag → cap 5 (giữ chỗ brand = chỉ lấy 4 từ AI)
+  assert.deepEqual(
+    telegramTest.buildHashtagList(["a", "b", "c", "d", "e", "f", "g"]),
+    ["a", "b", "c", "d", "TechBuzzDaily"],
+  );
+  // Case 4: Empty (backward compat schema cũ) → KHÔNG append brand đơn độc
+  assert.deepEqual(telegramTest.buildHashtagList([]), []);
+});
+
+// ────────────────────────────────────────────────────────────────────────────
 // Phase 6: ai parsing — schema mới + backward compat schema cũ
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -876,6 +1006,56 @@ test("ai.tryParseSummary: code fence ```json bị strip", () => {
 test("ai.tryParseSummary: thiếu field → null", () => {
   assert.equal(aiTest.tryParseSummary(JSON.stringify({ title: "x" })), null);
   assert.equal(aiTest.tryParseSummary("not json"), null);
+});
+
+test("ai.tryParseSummary Phase 19.7: parse enTldr + hashtags từ schema mới", () => {
+  const raw = JSON.stringify({
+    title: "T",
+    bullets: ["b1"],
+    whyItMatters: "w",
+    enTldr: "OpenAI launches GPT-5.",
+    hashtags: ["AI", "OpenAI", "GPT5"],
+  });
+  const r = aiTest.tryParseSummary(raw);
+  assert.ok(r);
+  assert.equal(r!.enTldr, "OpenAI launches GPT-5.");
+  assert.deepEqual(r!.hashtags, ["AI", "OpenAI", "GPT5"]);
+});
+
+test("ai.tryParseSummary Phase 19.7: backward compat — schema cũ không có enTldr/hashtags → fields rỗng", () => {
+  const raw = JSON.stringify({
+    title: "T",
+    bullets: ["b1"],
+    whyItMatters: "w",
+  });
+  const r = aiTest.tryParseSummary(raw);
+  assert.ok(r);
+  assert.equal(r!.enTldr, "");
+  assert.deepEqual(r!.hashtags, []);
+});
+
+test("ai.sanitizeRawHashtags Phase 19.7: bỏ '#', bỏ space, reject non-ASCII + dedupe", () => {
+  // Bỏ tiền tố #
+  assert.deepEqual(aiTest.sanitizeRawHashtags(["#AI", "##OpenAI"]), ["AI", "OpenAI"]);
+  // Bỏ space nội tại
+  assert.deepEqual(aiTest.sanitizeRawHashtags(["Open AI", "Machine Learning"]), [
+    "OpenAI",
+    "MachineLearning",
+  ]);
+  // Reject non-ASCII (tiếng Việt có dấu, emoji)
+  assert.deepEqual(aiTest.sanitizeRawHashtags(["CôngNghệ", "AI🚀", "OpenAI"]), ["OpenAI"]);
+  // Reject ký tự đặc biệt (-, !, .)
+  assert.deepEqual(aiTest.sanitizeRawHashtags(["AI-Lab", "GPT.5", "GPT5"]), ["GPT5"]);
+  // Dedupe case-insensitive
+  assert.deepEqual(aiTest.sanitizeRawHashtags(["AI", "ai", "Ai"]), ["AI"]);
+  // Reject quá dài (>30 chars)
+  assert.deepEqual(
+    aiTest.sanitizeRawHashtags(["A".repeat(31), "OK"]),
+    ["OK"],
+  );
+  // Cap 8 tag
+  const many = Array.from({ length: 12 }, (_, i) => `tag${i}`);
+  assert.equal(aiTest.sanitizeRawHashtags(many).length, 8);
 });
 
 // ────────────────────────────────────────────────────────────────────────────

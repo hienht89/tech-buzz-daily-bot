@@ -24,6 +24,21 @@ export type Summary = {
   title: string;
   bullets: string[];
   whyItMatters: string;
+  /**
+   * Phase 19.7 (bilingual hybrid): 1 câu English ≤200 chars tóm tắt fact chính
+   * cho người nước ngoài lướt qua. Tone neutral journalistic, KHÔNG emoji,
+   * KHÔNG Vietnamese. Optional — nếu provider trả schema cũ thì để rỗng và
+   * formatCaption skip section EN.
+   */
+  enTldr?: string;
+  /**
+   * Phase 19.7: 3-5 hashtag English relevant cho bài, chỉ alphanumeric
+   * (không có #, không khoảng trắng). VD ["AI","OpenAI","GPT5"]. Telegram hỗ
+   * trợ search hashtag global → giúp người EN discover. Brand hashtag
+   * `TechBuzzDaily` được auto-append trong formatCaption (không cần AI sinh).
+   * Optional — backward compat schema cũ.
+   */
+  hashtags?: string[];
 };
 
 export type SummarizeResult = {
@@ -31,22 +46,26 @@ export type SummarizeResult = {
   provider: string;
 };
 
-const PROMPT = `Bạn là biên tập viên cho kênh Telegram "Tech Buzz Daily" — kênh tin tức công nghệ tiếng Việt cho dân tech, tone Gen Z: trẻ, năng động, hơi "lầy" nhưng chuẩn xác.
+const PROMPT = `Bạn là biên tập viên cho kênh Telegram "Tech Buzz Daily" — kênh tin tức công nghệ tiếng Việt cho dân tech, tone Gen Z: trẻ, năng động, hơi "lầy" nhưng chuẩn xác. Kênh có cả người Việt lẫn người nước ngoài đọc.
 
-Hãy tóm tắt bài viết tech sau đây thành tiếng Việt theo format JSON CHÍNH XÁC:
+Hãy tóm tắt bài viết tech sau đây theo format JSON CHÍNH XÁC:
 {
   "title": "Tiêu đề tiếng Việt ngắn gọn, hấp dẫn (tối đa 90 ký tự). BẮT BUỘC bắt đầu bằng 1 emoji phù hợp (vd: 🚀 🤖 🧠 🛠️ 🔥 🎯 🪄 🧪 🛡️ 📱 💸).",
-  "bullets": ["2-3 bullet, mỗi bullet 1 câu ngắn gọn (≤120 ký tự), tóm tắt fact chính. KHÔNG mở đầu bằng dấu chấm, gạch ngang hay emoji — sẽ được render thành '• ...' tự động."],
-  "whyItMatters": "1 câu duy nhất (≤200 ký tự) trả lời 'Vì sao đáng đọc?' — nêu impact/insight cho dân tech Việt, không lặp lại bullet."
+  "bullets": ["2-3 bullet TIẾNG VIỆT, mỗi bullet 1 câu ngắn gọn (≤120 ký tự), tóm tắt fact chính. KHÔNG mở đầu bằng dấu chấm, gạch ngang hay emoji — sẽ được render thành '• ...' tự động."],
+  "whyItMatters": "1 câu TIẾNG VIỆT duy nhất (≤200 ký tự) trả lời 'Vì sao đáng đọc?' — nêu impact/insight cho dân tech Việt, không lặp lại bullet.",
+  "enTldr": "Exactly ONE English sentence (≤180 chars) summarizing the key fact for international readers. Neutral journalistic tone — NOT Gen Z. NO emoji. NO Vietnamese words. Self-contained: a foreigner who reads only this line should understand what the news is about.",
+  "hashtags": ["3-5 English hashtags relevant to the article, alphanumeric ONLY (no '#', no spaces, no special chars). Use CamelCase or PascalCase for multi-word. Examples: AI, OpenAI, GPT5, MachineLearning, Apple, iPhone17, Cybersecurity. KHÔNG dùng tiếng Việt, KHÔNG dùng dấu cách hay ký tự đặc biệt."]
 }
 
 QUY TẮC:
-- Văn phong trẻ, conversational, KHÔNG cứng nhắc kiểu báo chí.
+- Phần tiếng Việt (title, bullets, whyItMatters) văn phong trẻ, conversational, KHÔNG cứng nhắc kiểu báo chí.
+- Phần tiếng Anh (enTldr) tone trung lập chuyên nghiệp, KHÔNG copy y nguyên tiêu đề gốc — phải tóm tắt lại fact chính.
 - KHÔNG dịch tên riêng (OpenAI, Google, Meta, Anthropic, Hugging Face...).
-- Có thể dùng từ tiếng Anh phổ biến (AI, model, launch, startup, demo, beta, agent, benchmark, fine-tune...).
+- Có thể dùng từ tiếng Anh phổ biến trong phần Việt (AI, model, launch, startup, demo, beta, agent, benchmark, fine-tune...).
 - Bullet phải có nội dung CỤ THỂ từ bài (số liệu, tên model, ngày, tên người), KHÔNG nói chung chung.
 - KHÔNG bịa thông tin ngoài bài. Nếu bài quá ngắn, làm 2 bullet thay vì 3.
 - "whyItMatters" phải là góc nhìn / hệ quả, KHÔNG được lặp y nguyên 1 bullet.
+- Hashtag chọn từ KEYWORD chính của bài (tên company, tên model, lĩnh vực). KHÔNG cần thêm hashtag thương hiệu kênh — bot tự append.
 - TRẢ VỀ CHỈ JSON hợp lệ, KHÔNG markdown code fence, KHÔNG text giải thích.
 
 Bài viết:
@@ -444,7 +463,14 @@ function tryParseSummary(rawText: string): Summary | null {
     const bullets = sanitizeBullets(obj.bullets);
     const why = obj.whyItMatters.trim();
     if (bullets.length === 0 || !why) return null;
-    return { title, bullets, whyItMatters: why };
+    // Phase 19.7 (bilingual hybrid): parse optional enTldr + hashtags.
+    // Backward compat: nếu provider chưa update prompt hoặc trả thiếu →
+    // fallback rỗng, formatCaption sẽ tự skip section EN.
+    const enTldr = typeof obj.enTldr === "string" ? obj.enTldr.trim().slice(0, 250) : "";
+    const hashtags = Array.isArray(obj.hashtags)
+      ? sanitizeRawHashtags(obj.hashtags)
+      : [];
+    return { title, bullets, whyItMatters: why, enTldr, hashtags };
   }
 
   // Schema cũ — fallback graceful
@@ -456,7 +482,7 @@ function tryParseSummary(rawText: string): Summary | null {
     const bullets = sanitizeBullets(sentences.slice(0, 3));
     const why = obj.takeaway.trim();
     if (bullets.length === 0 || !why) return null;
-    return { title, bullets, whyItMatters: why };
+    return { title, bullets, whyItMatters: why, enTldr: "", hashtags: [] };
   }
 
   return null;
@@ -474,6 +500,40 @@ function sanitizeBullets(raw: unknown[]): string[] {
     if (!cleaned) continue;
     out.push(cleaned.length > MAX_BULLET_CHARS ? cleaned.slice(0, MAX_BULLET_CHARS - 1) + "…" : cleaned);
     if (out.length >= MAX_BULLETS) break;
+  }
+  return out;
+}
+
+/**
+ * Phase 19.7: sanitize hashtags từ AI ở tầng PARSE (chưa render).
+ *
+ * Quy tắc:
+ * - Bỏ tiền tố `#` nếu AI lỡ thêm vào.
+ * - Bỏ mọi khoảng trắng nội tại (vd "Open AI" → "OpenAI").
+ * - CHỈ giữ ký tự alphanumeric + underscore (Telegram hashtag spec).
+ *   Loại bỏ tag chứa ký tự non-ASCII (vd Việt có dấu, emoji) → tránh
+ *   hashtag không click được trên Telegram.
+ * - Giới hạn 30 chars/tag, max 8 tag (formatCaption sẽ trim tiếp).
+ *
+ * Tách riêng khỏi sanitizeBullets vì:
+ * - Bullets cho phép full Unicode + dấu (tiếng Việt).
+ * - Hashtag PHẢI alphanumeric ASCII để Telegram render thành link bấm được.
+ */
+const HASHTAG_VALID_REGEX = /^[A-Za-z0-9_]+$/;
+const MAX_HASHTAGS_PARSED = 8;
+const MAX_HASHTAG_CHARS = 30;
+
+function sanitizeRawHashtags(raw: unknown[]): string[] {
+  const out: string[] = [];
+  for (const item of raw) {
+    if (typeof item !== "string") continue;
+    const cleaned = item.trim().replace(/^#+/, "").replace(/\s+/g, "");
+    if (!cleaned || cleaned.length > MAX_HASHTAG_CHARS) continue;
+    if (!HASHTAG_VALID_REGEX.test(cleaned)) continue;
+    // Dedupe (case-insensitive)
+    if (out.some((h) => h.toLowerCase() === cleaned.toLowerCase())) continue;
+    out.push(cleaned);
+    if (out.length >= MAX_HASHTAGS_PARSED) break;
   }
   return out;
 }
@@ -589,6 +649,7 @@ export async function summarizeArticle(
 export const __test = {
   tryParseSummary,
   sanitizeBullets,
+  sanitizeRawHashtags,
   classifyHttpError,
   collectGeminiKeys,
   getProviders,
