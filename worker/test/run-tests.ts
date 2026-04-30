@@ -1390,34 +1390,35 @@ test("percentileOf: tất cả input đều NaN → 0", () => {
   assert.equal(percentileOf([NaN, Infinity, -Infinity], 0.5), 0);
 });
 
-test("computeDynamicThreshold: history < MIN_HISTORY_FOR_DYNAMIC → fallback 220", () => {
+test("computeDynamicThreshold: history < MIN_HISTORY_FOR_DYNAMIC → fallback (Phase 19.5: 195)", () => {
   // 0 entry → fallback
   assert.equal(computeDynamicThreshold([]), FALLBACK_THRESHOLD);
-  // 19 entry (vẫn dưới MIN=20) → fallback dù phân phối nói khác
-  const sparse = Array.from({ length: 19 }, (_, i) => ({ score: 100 + i }));
+  // 9 entry (vẫn dưới MIN=10) → fallback dù phân phối nói khác
+  const sparse = Array.from({ length: 9 }, (_, i) => ({ score: 100 + i }));
   assert.equal(computeDynamicThreshold(sparse), FALLBACK_THRESHOLD);
-  assert.ok(MIN_HISTORY_FOR_DYNAMIC === 20, "MIN_HISTORY_FOR_DYNAMIC kỳ vọng = 20");
+  assert.ok(MIN_HISTORY_FOR_DYNAMIC === 10, "MIN_HISTORY_FOR_DYNAMIC kỳ vọng = 10 (Phase 19.5)");
+  assert.ok(FALLBACK_THRESHOLD === 195, "FALLBACK_THRESHOLD kỳ vọng = 195 (Phase 19.5)");
 });
 
-test("computeDynamicThreshold: history ≥ MIN → tính p40, clamp về [180, 260]", () => {
-  // 25 entry phân phối đều quanh 220-260 → p40 nằm trong clamp range
+test("computeDynamicThreshold: history ≥ MIN → tính p25, clamp về [170, 260]", () => {
+  // 25 entry phân phối đều 200..248 → p25 nằm trong clamp range
   const hist = Array.from({ length: 25 }, (_, i) => ({ score: 200 + i * 2 })); // 200..248
   const t = computeDynamicThreshold(hist);
   assert.ok(t >= THRESHOLD_MIN_CLAMP && t <= THRESHOLD_MAX_CLAMP,
     `threshold ${t} phải nằm trong clamp [${THRESHOLD_MIN_CLAMP}, ${THRESHOLD_MAX_CLAMP}]`);
-  // sanity: với input 200..248, p40 ≈ 200 + 0.4*48 = 219.2 → round 219
-  assert.equal(t, 219);
+  // sanity: với input 200..248, p25 = sorted[0.25*24] = sorted[6] = 212
+  assert.equal(t, 212);
 });
 
-test("computeDynamicThreshold: clamp dưới khi p40 quá thấp", () => {
-  // 30 entry toàn score < 180 → p40 sẽ < 180 → clamp lên 180
+test("computeDynamicThreshold: clamp dưới khi percentile quá thấp", () => {
+  // 30 entry toàn score < 170 → percentile sẽ < 170 → clamp lên 170
   const lowHist = Array.from({ length: 30 }, (_, i) => ({ score: 50 + i })); // 50..79
   const t = computeDynamicThreshold(lowHist);
   assert.equal(t, THRESHOLD_MIN_CLAMP, `clamp dưới phải kéo lên ${THRESHOLD_MIN_CLAMP}`);
 });
 
-test("computeDynamicThreshold: clamp trên khi p40 quá cao", () => {
-  // 30 entry toàn score > 260 → p40 sẽ > 260 → clamp xuống 260
+test("computeDynamicThreshold: clamp trên khi percentile quá cao", () => {
+  // 30 entry toàn score > 260 → percentile sẽ > 260 → clamp xuống 260
   const highHist = Array.from({ length: 30 }, (_, i) => ({ score: 300 + i })); // 300..329
   const t = computeDynamicThreshold(highHist);
   assert.equal(t, THRESHOLD_MAX_CLAMP, `clamp trên phải kéo xuống ${THRESHOLD_MAX_CLAMP}`);
@@ -1454,13 +1455,14 @@ test("computeDynamicThreshold: output stable không phụ thuộc thứ tự his
 });
 
 test("computeDynamicThreshold: history exactly = MIN_HISTORY_FOR_DYNAMIC → dynamic mode (boundary)", () => {
-  // Kỳ vọng ranh giới `< MIN` (không `≤`): 20 entry phải KÍCH HOẠT dynamic.
+  // Kỳ vọng ranh giới `< MIN` (không `≤`): 10 entry phải KÍCH HOẠT dynamic.
   const hist = Array.from({ length: MIN_HISTORY_FOR_DYNAMIC }, (_, i) => ({ score: 240 + i }));
   const t = computeDynamicThreshold(hist);
-  // Với 240..259, p40 = 240 + 0.4*19 = 247.6 → round 248 → trong clamp
-  // → KHÔNG phải fallback 220
-  assert.notEqual(t, FALLBACK_THRESHOLD, "boundary: 20 entry kích hoạt dynamic mode");
-  assert.equal(t, 248);
+  // Với 240..249 (10 entry), p25 = sorted[0.25*9] = sorted[2.25]
+  //   = 242 * 0.75 + 243 * 0.25 = 242.25 → round 242 → trong clamp
+  // → KHÔNG phải fallback 195
+  assert.notEqual(t, FALLBACK_THRESHOLD, "boundary: 10 entry kích hoạt dynamic mode");
+  assert.equal(t, 242);
 });
 
 // Note: pushScoreHistory / getScoreHistory ở storage.ts KHÔNG có unit-test

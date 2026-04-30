@@ -70,6 +70,17 @@ Deployed to Cloudflare Workers. Migrated từ GitHub Actions vì GH Actions cron
   - **`runBot` ghi `lastAiError` vào `RunResult.reason`**: dry-run / `/run` giờ lộ message thực của provider cuối (không cần `wrangler tail`).
   - **`/top_today` thêm `topPreGate`**: top 10 bài có score cao nhất TRƯỚC khi qua MIN_SCORE_THRESHOLD + KV check → nhìn được score thực tế của batch hiện tại.
   - **Endpoint MỚI `/diag_ai`** (cần Bearer): probe từng AI provider trên 1 article giả, KHÔNG chạm KV/Telegram/RSS. Trả `{provider, ok, ms, error}` cho từng cái — chẩn đoán "provider nào sống/chết" trong 1 request.
+- **Phase 19.5 (Apr 30, 2026) — Threshold tuning chống miss slot (post-Task #7)**:
+  - **Vấn đề quan sát**: User báo bot bỏ slot 2h liên tiếp dù đã có 8 key Gemini khoẻ. `/top_today` cho thấy: 200 fetched / 138 tech / 122 scored / **eligible=0** / skippedLowScore=104. Nguyên nhân: Task #7 (Phase 19) hardcode `FALLBACK_THRESHOLD = 220` đè lên Phase 18.5 (190); historyCount=7 < MIN=20 → kẹt ở fallback 220 quá khắt khe trong cold-start.
+  - **4 thay đổi đồng thời** (`worker/src/threshold.ts`):
+    - `FALLBACK_THRESHOLD: 220 → 195` — gần với Phase 18.5 (190), buffer +5 vì đã có thêm filter strict.
+    - `DEFAULT_PERCENTILE: 0.4 → 0.25` (p40 → p25). Lý do: history hôm nay p40=234, p25 ≈ 212 — đủ chặn rác mà không skip slot vào giờ tin yếu.
+    - `MIN_HISTORY_FOR_DYNAMIC: 20 → 10`. Lý do: 12-18 tick/ngày → 10 mẫu = 12-20h thay vì 30h+. Bot kích hoạt dynamic ngay trong ngày deploy.
+    - `MIN_CLAMP: 180 → 170`. Cho dynamic mode dư địa hạ thấp khi nguồn yếu — clamp 260 trên vẫn chặn.
+  - **Verify deploy `e5d03665`**: ngay sau deploy `/top_today` cho **eligible=3** (trước 0), `skippedLowScore=0` (trước 104). Manual trigger lúc 02:55 UTC → bot post được "Musk v. Altman" (score 207) — slot 03:00 đáng lẽ bị skip.
+  - **Test**: 133/133 unit pass (cập nhật 5 test threshold để khớp constants mới + đổi label "p40" → "p25" trong log `index.ts`).
+  - **Tác động dự kiến**: hết miss slot trong cold-start (1-2 ngày đầu sau reset KV); ngày bình thường dynamic mode tự cân bằng; clamp 260 vẫn bảo vệ chất lượng khi nguồn "đại bịch".
+  - **KHÔNG đổi**: bucket quota, MAX_AGE_HOURS, scoring/dedup, AI provider chain.
 - **Phase 18.5 (Apr 29, 2026) — Throughput + circuit breaker tuning**:
   - **Cron 9 → 24 tick/ngày** (`wrangler.toml`): từ `0 0,2,4,6,8,10,12,14,16 * * *` về `0 * * * *`. Lý do: Phase 15+16+17 đã thắt scoring/dedup/threshold rất chặt → bài rác đã bị lọc ngay ở filter/score, không cần ép cron thưa để "bù chất". 9 tick/ngày + skip-low-score → thực tế chỉ post 3-6 bài/ngày, ít hơn cadence kỳ vọng.
   - **MIN_SCORE_THRESHOLD 220 → 190** (`index.ts`). Lý do: dữ liệu Phase 16 cho thấy 220 quá cao — top scores clustering 218–248, chỉ ~3% bài qua → quá nhiều slot bỏ trống. 190 cho phép ~50% bài qua trong khi vẫn loại priority 3 + recency cũ + không boost.

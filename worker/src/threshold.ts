@@ -8,41 +8,61 @@
  *
  * Giải pháp: tự tính ngưỡng động từ phân phối score thực tế của những bài đã
  * post (lưu trong KV `score_history_v1`, cap 200 entry ~ 22 ngày). Mặc định
- * lấy `p40` — tức nửa phần dưới của các bài đã post — làm sàn → bot chỉ chấp
- * nhận bài cao hơn ~60% history → tự thích nghi.
+ * lấy `p25` — tức 1/4 phần dưới của các bài đã post — làm sàn → bot chỉ chấp
+ * nhận bài cao hơn ~75% history → tự thích nghi.
  *
  * Clamp [MIN_CLAMP, MAX_CLAMP] để bảo vệ trong các trường hợp pathological:
- *   - Vài ngày RSS yếu → toàn bài score thấp → p40 tụt < 180 → bot có thể
- *     bắt đầu post rác. Clamp dưới chặn.
- *   - Vài ngày toàn bài "đại bịch" → p40 leo > 260 → bot có thể tự bịt mồm,
- *     skip slot oan dù bài còn lại vẫn khá. Clamp trên chặn.
+ *   - Vài ngày RSS yếu → toàn bài score thấp → percentile tụt < 170 → bot
+ *     có thể bắt đầu post rác. Clamp dưới chặn.
+ *   - Vài ngày toàn bài "đại bịch" → percentile leo > 260 → bot có thể tự
+ *     bịt mồm, skip slot oan dù bài còn lại vẫn khá. Clamp trên chặn.
  *
  * Cold start: khi history < MIN_HISTORY_FOR_DYNAMIC entry (vd KV vừa bị xóa,
- * hoặc bot mới deploy), trả `FALLBACK_THRESHOLD` (= ngưỡng cũ 220) để giữ
- * hành vi quen thuộc thay vì chọn 1 percentile có 5-10 mẫu (dễ lệch).
+ * hoặc bot mới deploy), trả `FALLBACK_THRESHOLD` (195) để giữ bot post được
+ * trong giai đoạn đầu thay vì chọn 1 percentile có quá ít mẫu (dễ lệch).
  *
  * Module này KHÔNG đụng KV, KHÔNG đụng Cloudflare runtime → unit-test thuần
  * trong Node được.
  */
 
-/** Ngưỡng dùng khi history < MIN_HISTORY_FOR_DYNAMIC. Khớp với hành vi cũ. */
-export const FALLBACK_THRESHOLD = 220;
-
-/** Sàn dưới: dù p40 history có tụt thấp đến mấy, threshold không < 180. */
-export const MIN_CLAMP = 180;
-
-/** Trần trên: dù p40 history có leo cao đến mấy, threshold không > 260. */
-export const MAX_CLAMP = 260;
-
-/** Percentile mặc định (40%) — "nửa dưới" của post history. */
-export const DEFAULT_PERCENTILE = 0.4;
+/**
+ * Ngưỡng dùng khi history < MIN_HISTORY_FOR_DYNAMIC.
+ *
+ * Phase 19.5 (30/4/2026): hạ 220 → 195 sau khi quan sát bot bỏ slot do
+ * cold-start fallback quá khắt khe (xem replit.md). 195 ≈ Phase 18.5 (190)
+ * cộng buffer nhẹ vì đã có thêm filter strict (arxiv, fluff, path penalty).
+ */
+export const FALLBACK_THRESHOLD = 195;
 
 /**
- * Số mẫu tối thiểu trước khi tin percentile. < số này → fallback. Chọn 20
- * vì với 9 tick/ngày, 20 mẫu ≈ 2 ngày — vừa đủ qua giai đoạn cold start mà
- * không phải đợi cả tuần để dynamic mode kick in.
+ * Sàn dưới: dù percentile history có tụt thấp đến mấy, threshold không < 170.
+ *
+ * Phase 19.5: hạ 180 → 170 để dynamic mode còn dư địa hạ thêm vào những giờ
+ * tin yếu mà không bị floor cứng chặn — clamp 260 trên vẫn bảo vệ chất lượng.
  */
-export const MIN_HISTORY_FOR_DYNAMIC = 20;
+export const MIN_CLAMP = 170;
+
+/** Trần trên: dù percentile history có leo cao đến mấy, threshold không > 260. */
+export const MAX_CLAMP = 260;
+
+/**
+ * Percentile mặc định (25%) — chỉ loại 1/4 bài kém điểm nhất trong history.
+ *
+ * Phase 19.5: hạ 0.4 → 0.25 sau khi p40 cho ra ~234 (cao hơn cả fallback cũ
+ * 220), khiến bot vẫn skip slot trong giờ tin yếu kể cả khi dynamic mode
+ * kích hoạt. p25 cho dynamic threshold ~210-215 — đủ chặn rác, không khắt
+ * khe quá vào giờ tin chậm.
+ */
+export const DEFAULT_PERCENTILE = 0.25;
+
+/**
+ * Số mẫu tối thiểu trước khi tin percentile. < số này → fallback.
+ *
+ * Phase 19.5: hạ 20 → 10 để rút ngắn cold-start. Với 12-18 tick/ngày, 10
+ * mẫu ≈ 12-20 giờ — bot kích hoạt dynamic ngay trong ngày deploy thay vì
+ * phải chờ qua đêm.
+ */
+export const MIN_HISTORY_FOR_DYNAMIC = 10;
 
 /**
  * Hàm percentile R-7 (Excel `PERCENTILE.INC`, NumPy default `linear`).
@@ -79,7 +99,7 @@ function clamp(x: number, min: number, max: number): number {
 /**
  * Tính threshold động từ history score.
  *
- *  - history < MIN_HISTORY_FOR_DYNAMIC → trả FALLBACK_THRESHOLD (220).
+ *  - history < MIN_HISTORY_FOR_DYNAMIC → trả FALLBACK_THRESHOLD (195).
  *  - Else: round(percentile p) clamp về [MIN_CLAMP, MAX_CLAMP].
  *
  * Round trước khi clamp để output luôn nguyên (tiện log + so sánh `score <

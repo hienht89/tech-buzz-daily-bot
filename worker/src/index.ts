@@ -133,22 +133,26 @@ const MAX_CANDIDATES_PER_RUN = 3;
  *     clustering quanh 218–248, chỉ ~3% bài qua 220 → nhiều slot trống.
  *   - Task 7 (Apr 2026): bỏ hard-code, tính ĐỘNG. Lý do: mỗi lần RSS đổi
  *     hoặc keyword bonus chỉnh, ngưỡng cũ có thể quá cao (skip oan) hoặc
- *     quá thấp (post rác) → phải edit code + redeploy. Data Phase 18 cũng
- *     informs clamp range [180, 260].
+ *     quá thấp (post rác) → phải edit code + redeploy.
+ *   - Phase 19.5 (Apr 30 2026): tuning constants để khắc phục miss slot —
+ *     fallback 220 → 195, percentile p40 → p25, MIN_HISTORY 20 → 10,
+ *     MIN_CLAMP 180 → 170. Xem replit.md Phase 19.5 + threshold.ts.
  *
  * Bây giờ: mỗi tick cron, bot đọc `score_history_v1` (200 score gần nhất của
- * bài đã post) → tính `p40` → clamp về [180, 260]. Bot tự thích nghi, không
+ * bài đã post) → tính `p25` → clamp về [170, 260]. Bot tự thích nghi, không
  * cần can thiệp.
  *
  * Triết lý KHÔNG đổi: thà skip slot còn hơn lấp slot bằng bài rác. Khi mọi
  * candidate < threshold động, bot sẽ KHÔNG POST trong tick đó, log reason=
  * "all candidates below MIN_SCORE_THRESHOLD={dynamicThreshold}".
  *
- * Cold start (history < 20 entry): fallback về 220 — hành vi cũ, an toàn.
+ * Cold start (history < 10 entry): fallback về 195 — đủ rộng để post được
+ * trong giai đoạn đầu sau deploy.
  *
  * Xem `worker/src/threshold.ts` cho công thức + comment chi tiết. Endpoint
  * `/stats` trả về threshold hiện tại + p20/p40/p60 + history count để admin
- * theo dõi.
+ * theo dõi (giữ p20/p40/p60 trong response cho dù default đã đổi sang p25
+ * vì 3 percentile này cho ra hình dạng phân phối — diagnostic value vẫn còn).
  */
 
 /**
@@ -475,7 +479,7 @@ async function maybeAlertSkippedSlot(
     `Hôm nay (${dayKey}, UTC) bot đã <b>bỏ qua ${newCount} slot</b> vì không có bài nào ` +
     `score ≥ <b>${minScoreThreshold}</b> (threshold động — Task 7).\n\n` +
     `Tick gần nhất có ${skippedLowScore} bài bị skip do score thấp.\n\n` +
-    `Có thể do nguồn RSS hôm nay yếu, hoặc threshold động đang bám p40 history ở mức ` +
+    `Có thể do nguồn RSS hôm nay yếu, hoặc threshold động đang bám p25 history ở mức ` +
     `cao. Kiểm tra <code>/stats</code> xem threshold hiện tại + p20/p40/p60 và ` +
     `<code>/top_today</code> xem điểm thực tế của batch.`;
   const sent = await sendAdminAlert(env, text);
@@ -506,8 +510,8 @@ async function maybeAlertSkippedSlot(
  * Đọc score history từ KV → tính threshold động (Task 7).
  *
  * KV read fail (vd binding tạm down, transient 5xx) KHÔNG bao giờ làm runBot
- * crash — fallback về `FALLBACK_THRESHOLD = 220` (hành vi cũ trước Task 7).
- * Bot có thể chạy "blind" 1 tick còn hơn skip vì lỗi cơ sở hạ tầng.
+ * crash — fallback về `FALLBACK_THRESHOLD` (xem threshold.ts để biết giá trị
+ * hiện tại). Bot có thể chạy "blind" 1 tick còn hơn skip vì lỗi cơ sở hạ tầng.
  *
  * Tách thành function riêng để: (a) tái sử dụng được trong endpoint /stats và
  * /top_today, (b) test được mà không phải mock cả runBotInternal.
@@ -525,9 +529,10 @@ async function resolveDynamicThreshold(env: Env, runId: string): Promise<number>
   }
   const threshold = computeDynamicThreshold(history);
   const isFallback = history.length < MIN_HISTORY_FOR_DYNAMIC;
+  const pctLabel = `p${Math.round(THRESHOLD_DEFAULT_PERCENTILE * 100)}`;
   console.log(
     `[bot:${runId}] Dynamic threshold = ${threshold} ` +
-      `(history=${history.length}, ${isFallback ? "FALLBACK (cold start)" : "p40 clamped to [" + THRESHOLD_MIN_CLAMP + "," + THRESHOLD_MAX_CLAMP + "]"})`,
+      `(history=${history.length}, ${isFallback ? "FALLBACK (cold start)" : pctLabel + " clamped to [" + THRESHOLD_MIN_CLAMP + "," + THRESHOLD_MAX_CLAMP + "]"})`,
   );
   return threshold;
 }
@@ -1008,7 +1013,7 @@ export default {
       try {
         // Task 7: dùng cùng dynamic threshold như runBotInternal — endpoint
         // này phải trả về CHÍNH XÁC kết quả pickCandidates sẽ làm khi cron
-        // chạy ngay bây giờ (thay vì áp ngưỡng cố định 220).
+        // chạy ngay bây giờ (thay vì áp ngưỡng cố định cũ).
         const minScoreThreshold = await resolveDynamicThreshold(env, runId);
         const pick = await pickCandidates(env, runId, minScoreThreshold);
         const now = new Date();
