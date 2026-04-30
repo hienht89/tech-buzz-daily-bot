@@ -17,35 +17,42 @@ export type DiagProviderResult = {
 };
 
 /**
- * Probe từng provider trong chain. Catch lỗi PER-PROVIDER (không break loop
+ * Probe từng provider trong chain. Catch lỗi PER-PROVIDER (không break Promise.all
  * nếu 1 cái throw) → đảm bảo /diag_ai luôn trả đủ N entry cho N provider,
  * ngay cả khi cái đầu fail.
+ *
+ * Phase 20.1: chạy SONG SONG (Promise.all) thay vì sequential — với 18+ provider
+ * (9 Gemini key × 2 model) sequential timeout sẽ vượt 30s waitUntil cap của
+ * Cloudflare Workers, /quota command không trả về kết quả. Mỗi provider độc lập
+ * (key/model riêng) nên parallel KHÔNG share quota — chỉ tăng tốc từ ~2-3 phút
+ * worst case xuống ~20-30s tổng (= max single timeout). Vẫn giữ thứ tự kết quả
+ * khớp thứ tự input qua Promise.all preserve order.
  */
 export async function probeProviders(
   providers: Array<{ name: string; call: (a: Article) => Promise<string> }>,
   article: Article,
 ): Promise<DiagProviderResult[]> {
-  const results: DiagProviderResult[] = [];
-  for (const p of providers) {
-    const t0 = Date.now();
-    try {
-      const raw = await p.call(article);
-      results.push({
-        provider: p.name,
-        ok: true,
-        ms: Date.now() - t0,
-        previewBytes: raw.length,
-      });
-    } catch (err) {
-      results.push({
-        provider: p.name,
-        ok: false,
-        ms: Date.now() - t0,
-        error: (err as Error).message?.slice(0, 400),
-      });
-    }
-  }
-  return results;
+  return await Promise.all(
+    providers.map(async (p) => {
+      const t0 = Date.now();
+      try {
+        const raw = await p.call(article);
+        return {
+          provider: p.name,
+          ok: true,
+          ms: Date.now() - t0,
+          previewBytes: raw.length,
+        };
+      } catch (err) {
+        return {
+          provider: p.name,
+          ok: false,
+          ms: Date.now() - t0,
+          error: (err as Error).message?.slice(0, 400),
+        };
+      }
+    }),
+  );
 }
 
 // ────────────────────────────────────────────────────────────────────────────
