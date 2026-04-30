@@ -27,10 +27,15 @@ compatibility_flags = ["nodejs_compat"]
 # Cloudflare Cron có thể trễ 1-3 phút so với giây 0 — giới hạn nền tảng.
 # ────────────────────────────────────────────────────────────────────────────
 #
-# Phase 19.8 (Apr 30 2026): thêm 3 cron refill `30/35/40 6 * * *` =
-# 06:30/06:35/06:40 UTC = 13:30/13:35/13:40 VN (= Eastern 01:30 — Mỹ ngủ sâu,
-# Gemini ổn). Refill chính là 06:30; 06:35 + 06:40 là backup cho slot mà 06:30
-# chưa kịp fill (Cloudflare cancel waitUntil sau ~30s).
+# Phase 19.9 (Apr 30 2026): refill chuyển sang 22:00/22:05/22:10 UTC
+# = 05:00/05:05/05:10 sáng VN. Lý do user feedback: refill cũ 06:30 UTC
+# (= 13:30 chiều VN) trùng khung post (UTC 0-17 = 7h sáng → 0h khuya VN) →
+# 2 cron có thể chạy đan xen, tăng rủi ro AI quota / KV throughput chia sẻ.
+# Khung KHÔNG post là UTC 18:00-23:59 (= 1h-7h sáng VN). Chọn UTC 22:00
+# vì để 2h đệm trước cron post đầu tiên (UTC 0:00 = 7h sáng VN) — đủ kể
+# cả khi 3 refill tick đều chạy chậm. Trade-off: mất "Mỹ ngủ" boost
+# (UTC 22 = 14:00 PT giờ làm Mỹ Tây), nhưng quota Gemini là per-key
+# nên không bị share đáng kể.
 #
 # Triết lý: tách AI summarize khỏi post path → post tick chỉ đọc queue → không
 # phụ thuộc AI realtime → không miss slot khi Gemini 503 high demand.
@@ -38,7 +43,7 @@ compatibility_flags = ["nodejs_compat"]
 # inline; refill kế tiếp skip slot đã có (peekSlot idempotent).
 # Xem `queue.ts` + `runQueueRefill`/`runQueuePost` trong `index.ts`.
 [triggers]
-crons = ["0 0-17 * * *", "30 6 * * *", "35 6 * * *", "40 6 * * *"]
+crons = ["0 0-17 * * *", "0 22 * * *", "5 22 * * *", "10 22 * * *"]
 
 # ────────────────────────────────────────────────────────────────────────────
 # KV: lưu lịch sử các URL đã đăng (thay thế posted.json)

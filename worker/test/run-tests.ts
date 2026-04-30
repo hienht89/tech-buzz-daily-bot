@@ -1781,7 +1781,7 @@ test("isPostHourUTC: chỉ 0..17 là post hour (Phase 19.6 cron)", () => {
   for (let h = 18; h <= 23; h++) assert.equal(isPostHourUTC(h), false, `${h} KHÔNG phải post hour`);
 });
 
-test("enumerateNextPostSlots: refill từ 06:30 UTC → 18 slot trải 2 ngày", () => {
+test("enumerateNextPostSlots: refill từ giữa khung post → 18 slot trải 2 ngày", () => {
   const slots = enumerateNextPostSlots(new Date("2026-04-30T06:30:00.000Z"), 18);
   assert.equal(slots.length, 18);
   // Slot đầu = 07:00 UTC cùng ngày

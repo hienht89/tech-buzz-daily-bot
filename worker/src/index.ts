@@ -866,14 +866,18 @@ export async function runBot(
 // ────────────────────────────────────────────────────────────────────────────
 
 /**
- * Cron expressions cho refill (3 tick spaced 5min apart từ 06:30 UTC = 13:30 VN).
- * 06:35 + 06:40 là backup cho slot mà 06:30 chưa kịp fill (Cloudflare cancel
+ * Cron expressions cho refill (3 tick spaced 5min apart từ 22:00 UTC = 05:00 VN).
+ * 22:05 + 22:10 là backup cho slot mà 22:00 chưa kịp fill (Cloudflare cancel
  * waitUntil sau ~30s). Refill idempotent qua peekSlot skip.
+ *
+ * Phase 19.9: chuyển từ 06:30/35/40 UTC (= 13:30 VN, trùng khung post 7h-0h)
+ * sang 22:00/05/10 UTC (= 5h sáng VN, ngoài khung post). 2h đệm trước cron
+ * post đầu tiên (UTC 0:00 = 7h sáng VN).
  */
 export const REFILL_CRON_EXPRS = new Set([
-  "30 6 * * *",
-  "35 6 * * *",
-  "40 6 * * *",
+  "0 22 * * *",
+  "5 22 * * *",
+  "10 22 * * *",
 ]);
 
 /** Số slot queue refill mỗi run = số tick post hourly trong 1 ngày (Phase 19.6). */
@@ -892,6 +896,18 @@ const REFILL_CANDIDATE_OVERFETCH = 2;
  *     (8 key chia ra → ~0.75 RPS/key) → an toàn rate limit.
  */
 const REFILL_PARALLEL_CHUNK = 6;
+
+/**
+ * Phase 19.9 (Apr 30 2026): user yêu cầu tối đa 2 bài / 1 nguồn / 18 slot
+ * để đa dạng — tránh case 1 outlet (vd AWS What's New) đăng 4 bài hot
+ * cùng ngày → bot lùa cả 4 vào queue → kênh nhìn như spam 1 nguồn.
+ *
+ * Cap tính TỔNG bài cùng nguồn trong queue (queued + đang fill).
+ * Áp dụng sau interleaveByCategory + trước slice primaries → fallbackPool
+ * cũng tự động không over-cap. Bài bị cap KHÔNG enqueue, dành slot cho
+ * candidate nguồn khác kế tiếp trong ordered list.
+ */
+const MAX_PER_SOURCE_QUEUE = 2;
 
 /** Round-robin candidates theo category để diversity. */
 function interleaveByCategory(candidates: readonly Article[]): Article[] {
@@ -928,9 +944,10 @@ export type RefillResult = {
 /**
  * Phase 19.8: tóm tắt sẵn 18 bài cho 18 tick post hourly kế tiếp, lưu vào KV.
  *
- * Triết lý: tách AI summarize khỏi post path. Refill chạy 1 lần/ngày lúc Mỹ
- * ngủ (06:30 UTC = Eastern 01:30) → Gemini không bị 503 high demand →
- * tỷ lệ thành công gần 100%. Post tick chỉ đọc KV → không phụ thuộc AI uptime.
+ * Triết lý: tách AI summarize khỏi post path. Refill chạy 1 lần/ngày lúc 5h
+ * sáng VN (22:00 UTC) → ngoài khung post (UTC 0-17) → 2 cron không đan xen
+ * → KV/AI quota không share → tỷ lệ thành công cao. Post tick chỉ đọc KV
+ * → không phụ thuộc AI uptime tại lúc post.
  *
  * Idempotent: re-run sẽ skip slot đã có queue (peekSlot check). Cho phép
  * trigger thủ công nhiều lần để bù slot fail trong cùng 1 chu kỳ.
@@ -953,6 +970,9 @@ async function runQueueRefill(env: Env): Promise<RefillResult> {
   const queuedUrls = new Set<string>();
   const queuedTitleHashes = new Set<string>();
   const queuedTitles: string[] = [];
+  // Phase 19.9: source count cho cap MAX_PER_SOURCE_QUEUE — base count khởi
+  // từ queue hiện có (qua listQueue bên dưới) → mỗi enqueue mới ++ counter.
+  const queuedSourceCount = new Map<string, number>();
   let skippedExisting = 0;
   for (const s of targetSlots) {
     const existing = await peekSlot(env, s);
@@ -970,6 +990,8 @@ async function runQueueRefill(env: Env): Promise<RefillResult> {
   }
   // Phase 19.8: include all queued entries (kể cả slot ngoài targetSlots —
   // ngừa case refill cuối ngày kéo lùi vào slot hôm sau).
+  // Phase 19.9: cũng count source ở đây (listQueue bao mọi slot, peekSlot
+  // chỉ target → dùng listQueue để tránh double-count + cover slot lệch).
   try {
     const all = await listQueue(env);
     for (const e of all) {
@@ -979,10 +1001,12 @@ async function runQueueRefill(env: Env): Promise<RefillResult> {
       if (e.payload.article.titleHash) {
         queuedTitleHashes.add(e.payload.article.titleHash);
       }
+      const src = e.payload.article.source;
+      queuedSourceCount.set(src, (queuedSourceCount.get(src) ?? 0) + 1);
     }
   } catch (err) {
     console.warn(
-      `[refill:${runId}] listQueue fail (continuing với target-only dedup): ${(err as Error).message?.slice(0, 200)}`,
+      `[refill:${runId}] listQueue fail (continuing với target-only dedup + empty source count): ${(err as Error).message?.slice(0, 200)}`,
     );
   }
 
@@ -1035,11 +1059,33 @@ async function runQueueRefill(env: Env): Promise<RefillResult> {
   // Diversity re-order trước khi alloc → primaries trải đều category, tránh
   // toàn bài "ai" khi ai bucket nhiều nhất.
   const ordered = interleaveByCategory(pick.candidates);
-  const primaries = ordered.slice(0, slotsToFill.length);
-  const fallbackPool = ordered.slice(slotsToFill.length);
+
+  // Phase 19.9: apply cap MAX_PER_SOURCE_QUEUE = 2/nguồn (tính cả bài đang
+  // queue + bài đang fill). Drop candidate nếu source đã đạt cap; preserve
+  // ordered position để fallbackPool cũng được trải đều theo source quota.
+  const sourceCounter = new Map<string, number>(queuedSourceCount);
+  const capped: Article[] = [];
+  let cappedSkipped = 0;
+  for (const a of ordered) {
+    const cur = sourceCounter.get(a.source) ?? 0;
+    if (cur >= MAX_PER_SOURCE_QUEUE) {
+      cappedSkipped++;
+      continue;
+    }
+    capped.push(a);
+    sourceCounter.set(a.source, cur + 1);
+  }
+  if (cappedSkipped > 0) {
+    console.log(
+      `[refill:${runId}] Per-source cap: skipped ${cappedSkipped} candidate (max ${MAX_PER_SOURCE_QUEUE}/source incl ${queuedSourceCount.size} đã queue)`,
+    );
+  }
+
+  const primaries = capped.slice(0, slotsToFill.length);
+  const fallbackPool = capped.slice(slotsToFill.length);
 
   console.log(
-    `[refill:${runId}] Candidates: ${pick.candidates.length} (overfetch ${REFILL_CANDIDATE_OVERFETCH}x), ` +
+    `[refill:${runId}] Candidates: ${pick.candidates.length} (overfetch ${REFILL_CANDIDATE_OVERFETCH}x) → cap ${capped.length}, ` +
       `fill ${slotsToFill.length} slot, primaries=${primaries.length} fallbackPool=${fallbackPool.length} ` +
       `skipExisting=${skippedExisting}`,
   );
@@ -1335,7 +1381,7 @@ export default {
     );
 
     // Phase 19.8: route theo cron expression.
-    //   - REFILL_CRON_EXPRS (06:30/35/40 UTC) → tóm tắt sẵn 18 bài cho ngày tới.
+    //   - REFILL_CRON_EXPRS (22:00/05/10 UTC = 5h sáng VN) → tóm tắt sẵn 18 bài.
     //   - Default ("0 0-17 * * *") → post 1 bài từ queue (slot = giờ tròn hiện tại).
     if (REFILL_CRON_EXPRS.has(controller.cron)) {
       ctx.waitUntil(
