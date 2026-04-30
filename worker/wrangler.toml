@@ -4,30 +4,30 @@ compatibility_date = "2024-12-01"
 compatibility_flags = ["nodejs_compat"]
 
 # ────────────────────────────────────────────────────────────────────────────
-# CRON: chạy MỖI 1 GIỜ → 24 tick/ngày (Phase 18, Apr 29 2026).
+# CRON: 18 tick/ngày — đúng 1 tick/giờ từ 7h sáng đến 0h khuya VN
+# (Phase 19.6, Apr 30 2026).
+#
+# UTC↔VN: VN = UTC+7. 7h VN = 0h UTC, 8h VN = 1h UTC, ..., 0h VN = 17h UTC.
+# Cron `0 0-17 * * *` = mỗi giờ tròn từ 0h UTC đến 17h UTC = 18 tick.
 #
 # Lịch sử:
-#   - Pre-Phase 15: mỗi 1 giờ × 18 tick (07–23 VN). 18 bài/ngày.
-#   - Phase 15 (Apr 28 2026): giảm xuống mỗi 2h × 9 tick để ưu tiên CHẤT.
-#   - Phase 18 (Apr 29 2026): tăng trở lại mỗi 1h × 24 tick.
+#   - Pre-Phase 15: 1h × 18 tick (07–23 VN). 18 bài/ngày — cadence cũ.
+#   - Phase 15 (Apr 28 2026): giảm 2h × 9 tick để ưu tiên CHẤT.
+#   - Phase 18 (Apr 29 2026): tăng lại 1h × 24 tick (cả đêm).
+#   - Phase 19.6 (Apr 30 2026): user yêu cầu ĐÚNG 18 bài/ngày, không miss
+#     slot, và không post đêm 1h-6h sáng VN. Đổi sang 18 tick 0-17 UTC,
+#     đồng thời bỏ skip-low-score gate trong code (xem `index.ts`).
 #
-# Lý do tăng (Phase 18):
-#   - Phase 15 + 16 + 17 đã thắt scoring/dedup/threshold rất chặt → bài rác
-#     đã bị lọc ngay ở filter/score, không cần ép cron thưa để "bù chất".
-#   - 9 tick/ngày + skip-low-score → thực tế chỉ post 3-6 bài/ngày, ít hơn
-#     daily-news cadence kỳ vọng cho channel.
-#   - 24 tick/ngày: trần 24 bài; nếu MIN_SCORE_THRESHOLD vẫn chặn ~50% thì
-#     vẫn ra 12-15 bài/ngày — đúng cadence "1 bài / vài giờ" cho dân tech VN.
-#   - Free Gemini quota: với 6-key rotation + circuit breaker mạnh hơn (Phase 18)
-#     pipeline AI đã chịu được tần suất 1h/tick.
+# Triết lý mới (Phase 19.6): "Always-post" — mỗi tick luôn cố post bài tốt
+# nhất hiện có từ pool đã qua 4 lớp filter (tech URL + tech title + arxiv
+# strict + dedup). KHÔNG bỏ slot vì score thấp nữa. Trade-off: đôi khi giờ
+# tin yếu (10h-14h trưa VN = đêm Mỹ) có bài chỉ chất lượng trung bình, nhưng
+# vẫn không phải bài rác.
 #
-# Quota mỗi bucket vẫn cap 18 (xem `bucket.ts`) → cap chặn category dominate
-# nhưng KHÔNG ép phải lấp đủ; nếu candidate < MIN_SCORE_THRESHOLD thì skip slot.
-#
-# Cloudflare Cron có độ chính xác trong vài giây.
+# Cloudflare Cron có thể trễ 1-3 phút so với giây 0 — giới hạn nền tảng.
 # ────────────────────────────────────────────────────────────────────────────
 [triggers]
-crons = ["0 * * * *"]
+crons = ["0 0-17 * * *"]
 
 # ────────────────────────────────────────────────────────────────────────────
 # KV: lưu lịch sử các URL đã đăng (thay thế posted.json)

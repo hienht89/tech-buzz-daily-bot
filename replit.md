@@ -70,6 +70,17 @@ Deployed to Cloudflare Workers. Migrated từ GitHub Actions vì GH Actions cron
   - **`runBot` ghi `lastAiError` vào `RunResult.reason`**: dry-run / `/run` giờ lộ message thực của provider cuối (không cần `wrangler tail`).
   - **`/top_today` thêm `topPreGate`**: top 10 bài có score cao nhất TRƯỚC khi qua MIN_SCORE_THRESHOLD + KV check → nhìn được score thực tế của batch hiện tại.
   - **Endpoint MỚI `/diag_ai`** (cần Bearer): probe từng AI provider trên 1 article giả, KHÔNG chạm KV/Telegram/RSS. Trả `{provider, ok, ms, error}` cho từng cái — chẩn đoán "provider nào sống/chết" trong 1 request.
+- **Phase 19.6 (Apr 30, 2026) — Always-post: 18 bài/ngày guarantee, không miss slot**:
+  - **Yêu cầu user**: bot phải post ĐÚNG 18 bài/ngày từ 7h sáng đến 0h khuya VN, không miss slot nào, đăng đúng giờ. Philosophical shift từ "thà skip còn hơn post rác" → "luôn post bài tốt nhất hiện có".
+  - **3 thay đổi đồng thời**:
+    1. **Cron `0 * * * *` (24 tick) → `0 0-17 * * *` (18 tick)** (`worker/wrangler.toml`). VN=UTC+7 → 7h VN = 0h UTC, 0h VN = 17h UTC. Bỏ post đêm 1h-6h sáng VN.
+    2. **Bỏ skip-low-score gate** trong `pickCandidates` (`worker/src/index.ts`). Threshold động vẫn được tính + log + hiển thị ở `/stats` để diagnostic, nhưng KHÔNG dùng để skip nữa. Mọi bài qua filter (tech URL + tech title + arxiv strict + dedup) đều thành candidate. `skippedLowScore` field vẫn tồn tại nhưng giờ là counter informational, không phản ánh skip thật.
+    3. **Nới bucket quota** (`worker/src/bucket.ts` `DEFAULT_QUOTA`): core 6→8, ai 5→7, dev 4→6, research 1→3, trend 2→4 (tổng 18→28). Cap rộng hơn để giảm bottleneck khi 1 category chiếm pool, nhưng vẫn giữ "fallback highest score chung" làm safety net khi mọi bucket đầy.
+  - **Cleanup**: `maybeAlertSkippedSlot` không còn được gọi (giữ function + `skipCounter.ts` để bật lại sau nếu cần monitoring). Cập nhật jsdoc Phase 19.6 cho `Env.TELEGRAM_ADMIN_CHAT_ID`, `MIN_SCORE_THRESHOLD` jsdoc block, `PickResult` field comments, log message "below threshold ... [informational, KHÔNG skip]".
+  - **Verify deploy `60b23d93`**: cron lock đúng `0 0-17 * * *`. Manual trigger lúc 03:17 UTC → bot post được bài "Microsoft reports sinking Xbox revenue" (score=201) trong khi threshold dynamic = 211 — bài này TRƯỚC ĐÂY sẽ bị skip vì 201 < 211. totalToday 4 → 5, usage `core 2/8, ai 2/7, dev 1/6, research 0/3, trend 0/4`. ✓
+  - **Test**: 133/133 pass (cập nhật 2 test bucket cho quota mới: `trend 2→4` full marker, `core 6/6→8/8(full)` + `ai 1/5→1/7`).
+  - **Trade-off đã trao đổi với user**: (a) đôi khi giờ tin yếu (10h-14h trưa VN = đêm Mỹ) bài có thể chất lượng trung bình thay vì xuất sắc — vẫn không phải bài rác vì qua 4 lớp filter; (b) Cloudflare cron có thể trễ 1-3 phút so với giây 0 (giới hạn nền tảng).
+  - **KHÔNG đổi**: scoring algo, dedup logic, AI provider chain (8 Gemini key + OpenRouter), Telegram channel/admin chat ID, MAX_AGE_HOURS, MAX_CANDIDATES_PER_RUN.
 - **Phase 19.5 (Apr 30, 2026) — Threshold tuning chống miss slot (post-Task #7)**:
   - **Vấn đề quan sát**: User báo bot bỏ slot 2h liên tiếp dù đã có 8 key Gemini khoẻ. `/top_today` cho thấy: 200 fetched / 138 tech / 122 scored / **eligible=0** / skippedLowScore=104. Nguyên nhân: Task #7 (Phase 19) hardcode `FALLBACK_THRESHOLD = 220` đè lên Phase 18.5 (190); historyCount=7 < MIN=20 → kẹt ở fallback 220 quá khắt khe trong cold-start.
   - **4 thay đổi đồng thời** (`worker/src/threshold.ts`):

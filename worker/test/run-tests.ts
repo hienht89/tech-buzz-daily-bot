@@ -748,8 +748,8 @@ test("bucket.selectFromBuckets: bucket đầy → skip, chọn từ bucket khác
     mkArticle({ title: "trend1", sourceCategory: "trend", score: 250 }),
     mkArticle({ title: "core1", sourceCategory: "core", score: 200 }),
   ];
-  // trend đã đầy 2/2 → phải chọn core1
-  const usage = { core: 0, ai: 0, dev: 0, research: 0, trend: 2 };
+  // trend đã đầy 4/4 (Phase 19.6 quota) → phải chọn core1
+  const usage = { core: 0, ai: 0, dev: 0, research: 0, trend: 4 };
   const r = selectFromBuckets(candidates, usage);
   assert.equal(r.fallback, false);
   assert.equal(r.picked?.title, "core1");
@@ -772,10 +772,10 @@ test("bucket.selectFromBuckets: empty candidates → null", () => {
 });
 
 test("bucket.formatUsage: hiện full marker khi đầy", () => {
-  // Quota mặc định Phase 15: core=6 → cần usage=6 để full
-  const s = formatUsage({ core: 6, ai: 1, dev: 0, research: 0, trend: 0 });
-  assert.match(s, /core 6\/6\(full\)/);
-  assert.match(s, /ai 1\/5/);
+  // Quota mặc định Phase 19.6: core=8 → cần usage=8 để full
+  const s = formatUsage({ core: 8, ai: 1, dev: 0, research: 0, trend: 0 });
+  assert.match(s, /core 8\/8\(full\)/);
+  assert.match(s, /ai 1\/7/);
 });
 
 // ────────────────────────────────────────────────────────────────────────────

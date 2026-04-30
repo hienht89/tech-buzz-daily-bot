@@ -1,19 +1,24 @@
 /**
  * Bucket selection — cap số bài/category để 1 nhóm không dominate.
  *
- * Quota mặc định (Phase 15, Apr 2026 — giảm research, tăng core):
- *   core     = 6   (↑ từ 5 — báo lớn ổn định, ưu tiên)
- *   ai       = 5
- *   dev      = 4
- *   research = 1   (↓ từ 2 — tránh arxiv niche dominate khi nguồn chính ít)
- *   trend    = 2
+ * Quota mặc định (Phase 19.6, Apr 30 2026 — nới rộng để hỗ trợ "always-post"):
+ *   core     = 8   (↑ từ 6 — báo lớn ổn định, ưu tiên cao nhất)
+ *   ai       = 7   (↑ từ 5)
+ *   dev      = 6   (↑ từ 4)
+ *   research = 3   (↑ từ 1 — đêm Mỹ thường chỉ còn arxiv tươi)
+ *   trend    = 4   (↑ từ 2)
  *   ──────────────
- *   total    = 18  (cap; cron mới chỉ 9 tick/ngày → quota là cap chứ không phải target)
+ *   total    = 28  (cap rộng; cron 18 tick/ngày → vẫn không bao giờ chạm cap)
  *
- * Lưu ý: cron giảm 18 → 9 tick/ngày (xem `wrangler.toml`). Quota tổng vẫn 18
- * vì đây là CAP (max) chứ không phải allocation. Trong điều kiện bình thường
- * mỗi ngày chỉ post 9 bài, không bao giờ chạm cap. Cap chỉ kick in khi:
- *   - 1 category có nhiều news ngon → cần phân bổ sang category khác
+ * Lý do tăng (Phase 19.6): user yêu cầu ĐÚNG 18 bài/ngày, không miss slot.
+ * Quota cũ 1/2 cho research/trend tạo bottleneck trong giờ tin yếu (vd 10h-14h
+ * trưa VN = đêm Mỹ): nếu RSS lúc đó chỉ còn arxiv tươi mà research đã full
+ * → bucket eligible = 0 → rơi vào fallback (highest score chung). Nới quota
+ * vẫn cho phép fallback hoạt động nhưng giảm tần suất phải fallback.
+ *
+ * Vẫn là CAP chứ không phải allocation: cron 18 tick + cap 28 → mỗi category
+ * có dư địa nhưng không thể chiếm hết. Cap chỉ kick in khi:
+ *   - 1 category có rất nhiều news ngon → cần phân bổ sang category khác
  *   - manual trigger nhiều lần ngoài cron
  *
  * Mỗi tick cron → chạy 1 lần → đăng tối đa 1 bài. Ta chọn:
@@ -31,13 +36,13 @@ import type { SourceCategory } from "./sources.js";
 
 // ────────────────────────────────────────────────────────────────────────────
 
-/** Quota mặc định mỗi ngày, tổng = 18 (cap, không phải target — xem comment top file). */
+/** Quota mặc định mỗi ngày, tổng = 28 (cap rộng, không phải target — xem comment top file). */
 export const DEFAULT_QUOTA: Record<SourceCategory, number> = {
-  core: 6,
-  ai: 5,
-  dev: 4,
-  research: 1,
-  trend: 2,
+  core: 8,
+  ai: 7,
+  dev: 6,
+  research: 3,
+  trend: 4,
 };
 
 const QUOTA_PREFIX = "quota:";

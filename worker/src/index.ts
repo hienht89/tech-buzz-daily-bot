@@ -89,14 +89,15 @@ export interface Env {
    */
   RUN_TRIGGER_TOKEN?: string;
   /**
-   * Chat ID nhận cảnh báo Telegram khi bot bỏ qua ≥ SKIP_ALERT_THRESHOLD slot
-   * trong ngày do "all candidates below MIN_SCORE_THRESHOLD".
+   * Chat ID nhận cảnh báo Telegram (admin DM hoặc channel test).
+   *
+   * Phase 19.6: KHÔNG còn dùng cho cảnh báo "skipped slot" (đã bỏ skip-low-score
+   * gate). Vẫn giữ để có thể tái sử dụng cho các alert tương lai (vd AI dead).
    *
    * Có thể là DM admin (số dương, vd `123456789`) hoặc 1 channel test riêng
    * (vd `@my_admin_alerts` / `-100123…`).
    *
-   * KHÔNG set → tắt cảnh báo (counter vẫn chạy nền, có thể đọc qua /stats).
-   * Đặt qua `wrangler secret put TELEGRAM_ADMIN_CHAT_ID`.
+   * KHÔNG set → tắt mọi cảnh báo. Đặt qua `wrangler secret put TELEGRAM_ADMIN_CHAT_ID`.
    */
   TELEGRAM_ADMIN_CHAT_ID?: string;
 }
@@ -125,46 +126,35 @@ const MAX_AGE_HOURS = 30;
 const MAX_CANDIDATES_PER_RUN = 3;
 
 /**
- * Min score để 1 bài được coi là "đáng post" — TỪ TASK 7 (Apr 2026): TÍNH ĐỘNG.
+ * Threshold điểm — TÍNH ĐỘNG nhưng CHỈ DÙNG ĐỂ HIỂN THỊ (Phase 19.6, Apr 30 2026).
  *
  * Lịch sử:
- *   - Phase 15 (Apr 28 2026): khởi đầu hard-code = 220.
- *   - Phase 18 (Apr 29 2026): hạ 220 → 190 dựa trên data 7 ngày — top scores
- *     clustering quanh 218–248, chỉ ~3% bài qua 220 → nhiều slot trống.
- *   - Task 7 (Apr 2026): bỏ hard-code, tính ĐỘNG. Lý do: mỗi lần RSS đổi
- *     hoặc keyword bonus chỉnh, ngưỡng cũ có thể quá cao (skip oan) hoặc
- *     quá thấp (post rác) → phải edit code + redeploy.
- *   - Phase 19.5 (Apr 30 2026): tuning constants để khắc phục miss slot —
- *     fallback 220 → 195, percentile p40 → p25, MIN_HISTORY 20 → 10,
- *     MIN_CLAMP 180 → 170. Xem replit.md Phase 19.5 + threshold.ts.
+ *   - Phase 15 (Apr 28 2026): khởi đầu hard-code = 220, dùng làm gate skip.
+ *   - Phase 18 (Apr 29 2026): hạ 220 → 190.
+ *   - Task 7 (Apr 2026): bỏ hard-code, tính động từ percentile của score history.
+ *   - Phase 19.5 (Apr 30 2026): tuning constants — fallback 195, p25, MIN_CLAMP 170.
+ *   - Phase 19.6 (Apr 30 2026): GỠ vai trò gate. User yêu cầu 18 bài/ngày
+ *     guarantee → không skip slot vì score thấp nữa. Threshold vẫn được tính
+ *     mỗi tick để hiển thị ở /stats và đếm informational "below threshold" trong
+ *     log, nhưng KHÔNG ảnh hưởng decision có post hay không.
  *
- * Bây giờ: mỗi tick cron, bot đọc `score_history_v1` (200 score gần nhất của
- * bài đã post) → tính `p25` → clamp về [170, 260]. Bot tự thích nghi, không
- * cần can thiệp.
+ * Cách bot chọn bài (Phase 19.6):
+ *   1. Filter pipeline (tech URL + tech title + arxiv strict + dedup) — vẫn nguyên.
+ *   2. Tất cả bài qua filter đều thành candidate (không gate score nữa).
+ *   3. Bucket selection chọn highest-score trong bucket còn quota; nếu mọi bucket
+ *      đầy → fallback highest-score chung.
+ *   4. Mỗi tick → đăng đúng 1 bài.
  *
- * Triết lý KHÔNG đổi: thà skip slot còn hơn lấp slot bằng bài rác. Khi mọi
- * candidate < threshold động, bot sẽ KHÔNG POST trong tick đó, log reason=
- * "all candidates below MIN_SCORE_THRESHOLD={dynamicThreshold}".
- *
- * Cold start (history < 10 entry): fallback về 195 — đủ rộng để post được
- * trong giai đoạn đầu sau deploy.
- *
- * Xem `worker/src/threshold.ts` cho công thức + comment chi tiết. Endpoint
- * `/stats` trả về threshold hiện tại + p20/p40/p60 + history count để admin
- * theo dõi (giữ p20/p40/p60 trong response cho dù default đã đổi sang p25
- * vì 3 percentile này cho ra hình dạng phân phối — diagnostic value vẫn còn).
+ * Threshold hiển thị: /stats trả về threshold hiện tại + p20/p40/p60 + history
+ * count để admin theo dõi distribution score đang post. Xem `worker/src/threshold.ts`.
  */
 
 /**
- * Số slot/ngày bị skip do "all candidates below MIN_SCORE_THRESHOLD" trước
+ * [DEPRECATED Phase 19.6] Số slot/ngày bị skip do "all candidates below threshold" trước
  * khi gửi cảnh báo Telegram cho admin (Task 6, Apr 2026).
  *
- * Triết lý: 1 slot skip lẻ tẻ là bình thường (RSS feed có lúc kém), nhưng
- * ≥ 3 slot/ngày = RSS đang yếu / threshold đặt quá cao → admin cần biết để
- * điều chỉnh sớm. Cron 9 tick/ngày → 3 slot ≈ 1/3 ngày bỏ trống.
- *
- * Cảnh báo CHỈ gửi 1 lần/ngày (đúng lúc counter vừa CROSS từ 2 → 3) để tránh
- * spam DM admin mỗi tick. Counter reset mỗi ngày qua KV TTL.
+ * Phase 19.6: KHÔNG còn được gọi. Constant giữ lại để tương thích với type +
+ * tránh xóa skipCounter.ts (vẫn có thể bật lại sau nếu cần monitoring).
  */
 const SKIP_ALERT_THRESHOLD = 3;
 
@@ -206,14 +196,18 @@ type PickResult = {
   techCount: number;
   scoredCount: number;
   clusteredCount: number;
-  /** Số bài bị skip vì score < threshold động (Task 7). */
+  /**
+   * Số bài có score < threshold động (informational, Phase 19.6 KHÔNG còn skip
+   * vì lý do này — chỉ đếm để hiển thị distribution).
+   */
   skippedLowScore: number;
-  /** Threshold động đã dùng cho run này — bubble lên để log/response. */
+  /** Threshold động đã tính (chỉ informational từ Phase 19.6) — bubble lên để log/response. */
   minScoreThreshold: number;
   /**
-   * Top 10 article PRE-gate (sau cluster, trước threshold + KV check).
-   * Dùng để diagnostic: nếu eligibleCount=0 mà topPreGate vẫn có bài, biết
-   * ngay là threshold quá cao chứ không phải hết bài (Phase 16).
+   * Top 10 article PRE-bucket (sau cluster + dedup, trước bucket selection).
+   * Dùng để diagnostic distribution score / so sánh với what-was-posted.
+   * Phase 19.6: không còn "pre-gate" vì threshold gate đã bỏ — đổi tên ngữ nghĩa
+   * thành "top sau dedup" trong log/UI.
    */
   topPreGate: Article[];
 };
@@ -321,15 +315,13 @@ async function pickCandidates(
       );
       continue;
     }
-    // Min-score gate (Task 7: dynamic) — thà skip slot còn hơn post bài rác.
-    // Vì `clustered` đã sort DESC theo score, gặp bài đầu tiên dưới ngưỡng
-    // → tất cả bài còn lại cũng dưới ngưỡng → break sớm.
+    // Phase 19.6: bỏ min-score gate. Triết lý mới "always-post" — luôn cố
+    // post bài tốt nhất hiện có, không bỏ slot vì score thấp. Threshold vẫn
+    // được tính ra (cho /stats hiển thị + đếm informational dưới đây) nhưng
+    // KHÔNG dùng để skip. Bài vẫn qua 4 lớp filter trước (tech URL + tech
+    // title + arxiv strict + dedup) nên không có rủi ro post bài rác.
     if ((a.score ?? 0) < minScoreThreshold) {
-      skippedLowScore++;
-      // Không break ngay vì có thể có 1-2 bài score thấp xen giữa do
-      // dedup loại các bài score cao hơn — nhưng đã sort DESC nên break
-      // là an toàn về mặt logic. Vẫn loop tiếp để đếm chính xác cho log.
-      continue;
+      skippedLowScore++; // chỉ để log/diagnostic, không skip
     }
     candidates.push(a);
     if (candidates.length >= MAX_CANDIDATES_PER_RUN) break;
@@ -338,8 +330,8 @@ async function pickCandidates(
   console.log(
     `[bot:${runId}] Eligible after dedup: ${candidates.length} ` +
       `(skipped: ${skippedPosted} url-posted, ${skippedTitlePosted} title-posted, ` +
-      `${skippedPoison} poison, ${skippedFuzzy} fuzzy, ` +
-      `${skippedLowScore} below MIN_SCORE_THRESHOLD=${minScoreThreshold} [dynamic])`,
+      `${skippedPoison} poison, ${skippedFuzzy} fuzzy; ` +
+      `${skippedLowScore} below threshold ${minScoreThreshold} [informational, KHÔNG skip])`,
   );
 
   // Log top scoring candidates breakdown
@@ -556,31 +548,18 @@ async function runBotInternal(
   const pick = await pickCandidates(env, runId, minScoreThreshold);
 
   if (pick.candidates.length === 0) {
-    const isLowScoreSkip =
-      pick.skippedLowScore > 0 && pick.clusteredCount > 0;
+    // Phase 19.6: bỏ branch "all below MIN_SCORE_THRESHOLD" vì threshold không
+    // còn gate nữa. Giờ candidates=0 chỉ xảy ra do nguyên nhân kỹ thuật/data:
+    // RSS chết, không có bài fresh, không bài nào qua tech filter, hoặc tất
+    // cả đã đăng/poison/dup.
     const reason = pick.totalFetched === 0
       ? "all RSS sources failed"
       : pick.freshCount === 0
         ? "no fresh articles (>48h)"
         : pick.techCount === 0
           ? "no tech-relevant articles after filter"
-          : isLowScoreSkip
-            ? `all candidates below MIN_SCORE_THRESHOLD=${minScoreThreshold} [dynamic] ` +
-              `(${pick.skippedLowScore} bài bị skip vì score thấp) — slot bỏ trống ưu tiên chất lượng`
-            : "all candidates đã đăng / poison / dup";
+          : "all candidates đã đăng / poison / dup";
     console.warn(`[bot:${runId}] No candidate to try. Reason: ${reason}`);
-
-    // ───── Task 6: cảnh báo Telegram khi quá nhiều slot bị skip do thiếu bài ─────
-    // CHỈ tăng counter cho lý do "all candidates below MIN_SCORE_THRESHOLD".
-    // Các reason khác (RSS chết, AI quota cạn, v.v.) là sự cố kỹ thuật riêng,
-    // sẽ có alert riêng (xem các task khác trong backlog).
-    //
-    // Bỏ qua khi `dryRun` để admin curl `/run?dry=1` test thoải mái mà không
-    // bị spam alert hay làm sai counter ngày thật.
-    if (isLowScoreSkip && !dry) {
-      await maybeAlertSkippedSlot(env, runId, pick.skippedLowScore, minScoreThreshold);
-    }
-
     return { runId, posted: false, attempted: 0, reason };
   }
 
@@ -963,9 +942,9 @@ export default {
         totalToday,
         totalQuota,
         usageStr: formatUsage(usage),
-        // Task 6: số slot bị skip do "all candidates below MIN_SCORE_THRESHOLD"
-        // hôm nay + ngưỡng cảnh báo. Cảnh báo Telegram đã gửi khi
-        // skippedSlotCount >= alertThreshold (xem maybeAlertSkippedSlot).
+        // [DEPRECATED Phase 19.6] Counter cũ cho slot bị skip do score thấp.
+        // Từ Phase 19.6 luôn = 0 vì bot không còn skip slot. Giữ trong response
+        // để admin cũ không bị broken-field; sẽ xóa sau vài ngày verify ổn định.
         skippedSlotCount,
         skippedSlotAlertThreshold: SKIP_ALERT_THRESHOLD,
         // Task 7: threshold động + phân phối p20/p40/p60 + history count.
@@ -1209,7 +1188,7 @@ export default {
         "  GET  /sources   (Bearer)      — source health report\n" +
         "  GET  /stats     (Bearer)      — bucket usage hôm nay + threshold động (Task 7) + recent titles\n" +
         "  GET  /last      (Bearer)      — snapshot bài đăng gần nhất\n" +
-        "  GET  /top_today (Bearer)      — top 10 candidate eligible + topPreGate (top 10 trước MIN_SCORE_THRESHOLD)\n" +
+        "  GET  /top_today (Bearer)      — top 10 candidate sau filter+dedup (Phase 19.6: không còn gate threshold)\n" +
         "  GET  /diag_ai   (Bearer)      — Phase 16: probe từng AI provider, trả {provider, ok, ms, error}\n" +
         "  GET  /debug_kv  (Bearer)      — Phase 17: round-trip POSTED_KV (put→get→delete) verify binding sống\n",
       { status: 200, headers: { "Content-Type": "text/plain" } },
