@@ -5,7 +5,7 @@ import {
   type SourceCategory,
 } from "./sources.js";
 import { fetchAllSources, type Article, type SourceStat } from "./rss.js";
-import { summarizeArticle, getProviders } from "./ai.js";
+import { summarizeArticle, getProviders, type Summary } from "./ai.js";
 import {
   probeProviders,
   probeKvRoundTrip,
@@ -17,7 +17,7 @@ import { postArticle, sendAdminAlert } from "./telegram.js";
 import { extractOgImage } from "./og.js";
 import { isRelevantArxivPaper } from "./filter.js";
 import { scoreArticle, formatBreakdown } from "./score.js";
-import { clusterBatch, checkFuzzyDuplicate } from "./dedup.js";
+import { clusterBatch, checkFuzzyDuplicate, normalizeTitle } from "./dedup.js";
 import {
   DEFAULT_QUOTA,
   formatUsage,
@@ -58,6 +58,18 @@ import {
   wasAdminAlertSent,
   markAdminAlertSent,
 } from "./skipCounter.js";
+import {
+  slotKeyForUTC,
+  currentHourSlot,
+  enumerateNextPostSlots,
+  enqueueSlot,
+  peekSlot,
+  dequeueSlot,
+  listQueue,
+  articleToJson,
+  articleFromJson,
+  type QueuePayload,
+} from "./queue.js";
 
 export interface Env {
   POSTED_KV: KVNamespace;
@@ -231,6 +243,10 @@ async function pickCandidates(
   env: Env,
   runId: string,
   minScoreThreshold: number,
+  maxCandidates: number = MAX_CANDIDATES_PER_RUN,
+  extraSkipUrls: ReadonlySet<string> = new Set(),
+  extraSkipTitleHashes: ReadonlySet<string> = new Set(),
+  extraFuzzyTitles: readonly string[] = [],
 ): Promise<PickResult> {
   console.log(`[bot:${runId}] Fetching ${RSS_SOURCES.length} RSS sources...`);
   const { articles, stats } = await fetchAllSources(RSS_SOURCES);
@@ -286,6 +302,18 @@ async function pickCandidates(
 
   // Layer 1 + Layer 2 dedup vs KV + min-score gate
   const recentTitles = await getRecentTitles(env);
+  // Phase 19.8: queued titles (đang queue chưa post) check riêng với threshold
+  // THẤP HƠN (0.65 vs 0.88 default) — vì Elon Musk drama / SoftBank IPO etc
+  // được nhiều source viết title khác nhau ("Musk takes stand" vs "Day two of
+  // Musk vs OpenAI"), Jaccard token chỉ ~0.5-0.7. Threshold thấp hơn catch
+  // case này nhưng chỉ apply cho queued-window để KHÔNG quá restrictive với
+  // historical posted (tránh false-positive cho follow-up legit).
+  const queuedFuzzyEntries = extraFuzzyTitles.map((t) => ({
+    norm: normalizeTitle(t),
+    raw: t,
+    postedAt: "queued",
+  }));
+  const QUEUED_FUZZY_THRESHOLD = 0.75;
   const candidates: Article[] = [];
   let skippedPosted = 0;
   let skippedTitlePosted = 0;
@@ -293,6 +321,7 @@ async function pickCandidates(
   let skippedFuzzy = 0;
   let skippedLowScore = 0;
 
+  let skippedQueued = 0;
   for (const a of clustered) {
     if (await isPosted(env, a.link)) {
       skippedPosted++;
@@ -300,6 +329,16 @@ async function pickCandidates(
     }
     if (await isTitlePosted(env, a.title)) {
       skippedTitlePosted++;
+      continue;
+    }
+    // Phase 19.8: skip article đang ở trong queue chưa post — tránh refill
+    // chạy nhiều lần pick lại cùng top article rồi enqueue ở slot khác.
+    if (extraSkipUrls.has(a.canonicalUrl) || extraSkipUrls.has(a.link)) {
+      skippedQueued++;
+      continue;
+    }
+    if (a.titleHash && extraSkipTitleHashes.has(a.titleHash)) {
+      skippedQueued++;
       continue;
     }
     const fc = await getFailCount(env, a.link);
@@ -315,6 +354,22 @@ async function pickCandidates(
       );
       continue;
     }
+    // Phase 19.8: queued-window fuzzy với threshold thấp hơn (0.65) để catch
+    // multi-source coverage cùng event (Elon Musk drama, SoftBank IPO etc).
+    if (queuedFuzzyEntries.length > 0) {
+      const fuzzyQ = checkFuzzyDuplicate(
+        a.title,
+        queuedFuzzyEntries,
+        QUEUED_FUZZY_THRESHOLD,
+      );
+      if (fuzzyQ.duplicate) {
+        skippedQueued++;
+        console.log(
+          `[bot:${runId}]   Queued-fuzzy (${fuzzyQ.similarity.toFixed(2)}): "${a.title.slice(0, 70)}" ≈ queued "${fuzzyQ.similarTo.slice(0, 70)}"`,
+        );
+        continue;
+      }
+    }
     // Phase 19.6: bỏ min-score gate. Triết lý mới "always-post" — luôn cố
     // post bài tốt nhất hiện có, không bỏ slot vì score thấp. Threshold vẫn
     // được tính ra (cho /stats hiển thị + đếm informational dưới đây) nhưng
@@ -324,13 +379,13 @@ async function pickCandidates(
       skippedLowScore++; // chỉ để log/diagnostic, không skip
     }
     candidates.push(a);
-    if (candidates.length >= MAX_CANDIDATES_PER_RUN) break;
+    if (candidates.length >= maxCandidates) break;
   }
 
   console.log(
     `[bot:${runId}] Eligible after dedup: ${candidates.length} ` +
       `(skipped: ${skippedPosted} url-posted, ${skippedTitlePosted} title-posted, ` +
-      `${skippedPoison} poison, ${skippedFuzzy} fuzzy; ` +
+      `${skippedQueued} already-queued, ${skippedPoison} poison, ${skippedFuzzy} fuzzy; ` +
       `${skippedLowScore} below threshold ${minScoreThreshold} [informational, KHÔNG skip])`,
   );
 
@@ -807,6 +862,441 @@ export async function runBot(
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Phase 19.8 — Queue-based scheduling
+// ────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Cron expressions cho refill (3 tick spaced 5min apart từ 06:30 UTC = 13:30 VN).
+ * 06:35 + 06:40 là backup cho slot mà 06:30 chưa kịp fill (Cloudflare cancel
+ * waitUntil sau ~30s). Refill idempotent qua peekSlot skip.
+ */
+export const REFILL_CRON_EXPRS = new Set([
+  "30 6 * * *",
+  "35 6 * * *",
+  "40 6 * * *",
+]);
+
+/** Số slot queue refill mỗi run = số tick post hourly trong 1 ngày (Phase 19.6). */
+const REFILL_SLOTS = 18;
+
+/** Tỷ lệ candidate dự phòng / slot — đảm bảo đủ bài khi 1 số candidate fail AI. */
+const REFILL_CANDIDATE_OVERFETCH = 2;
+
+/**
+ * Số AI summarize chạy song song mỗi batch.
+ *
+ * Vì sao chunked thay vì parallel-all:
+ *   - Cloudflare Workers `ctx.waitUntil` cancel sau ~30s → tuần tự 18×3-5s = bust.
+ *   - Parallel-all 18 → spike Gemini per-key RPM (15 RPM × 8 key) → 429 storm.
+ *   - 6 song song × 3 batch ≈ 15-25s, dưới 30s limit, mỗi batch ≤ 6 RPS / key
+ *     (8 key chia ra → ~0.75 RPS/key) → an toàn rate limit.
+ */
+const REFILL_PARALLEL_CHUNK = 6;
+
+/** Round-robin candidates theo category để diversity. */
+function interleaveByCategory(candidates: readonly Article[]): Article[] {
+  const buckets: Record<SourceCategory, Article[]> = {
+    core: [], ai: [], dev: [], research: [], trend: [],
+  };
+  for (const c of candidates) buckets[c.sourceCategory].push(c);
+  const order: SourceCategory[] = ["core", "ai", "dev", "research", "trend"];
+  const out: Article[] = [];
+  while (true) {
+    let added = false;
+    for (const cat of order) {
+      const a = buckets[cat].shift();
+      if (a) {
+        out.push(a);
+        added = true;
+      }
+    }
+    if (!added) break;
+  }
+  return out;
+}
+
+export type RefillResult = {
+  runId: string;
+  refilled: number;
+  skippedExisting: number;
+  failed: number;
+  totalSlots: number;
+  reason?: string;
+  enqueued: { slotKey: string; title: string; provider: string }[];
+};
+
+/**
+ * Phase 19.8: tóm tắt sẵn 18 bài cho 18 tick post hourly kế tiếp, lưu vào KV.
+ *
+ * Triết lý: tách AI summarize khỏi post path. Refill chạy 1 lần/ngày lúc Mỹ
+ * ngủ (06:30 UTC = Eastern 01:30) → Gemini không bị 503 high demand →
+ * tỷ lệ thành công gần 100%. Post tick chỉ đọc KV → không phụ thuộc AI uptime.
+ *
+ * Idempotent: re-run sẽ skip slot đã có queue (peekSlot check). Cho phép
+ * trigger thủ công nhiều lần để bù slot fail trong cùng 1 chu kỳ.
+ *
+ * Bucket diversity: round-robin 5 category (core/ai/dev/research/trend) khi
+ * pick từng slot — không strict respect quota cũ vì 18 slot cần ≈ tổng quota.
+ */
+async function runQueueRefill(env: Env): Promise<RefillResult> {
+  const runId = shortRunId();
+  console.log(`[refill:${runId}] Queue refill started`);
+
+  const minScoreThreshold = await resolveDynamicThreshold(env, runId);
+  const targetSlots = enumerateNextPostSlots(new Date(), REFILL_SLOTS);
+  const enqueued: RefillResult["enqueued"] = [];
+
+  // Skip slot đã có queue → giữ idempotent. Đồng thời gom URL + titleHash
+  // của bài đang queued để truyền sang pickCandidates làm extraSkip → tránh
+  // refill chạy lại pick lại đúng top article rồi enqueue dup ở slot khác.
+  const slotsToFill: Date[] = [];
+  const queuedUrls = new Set<string>();
+  const queuedTitleHashes = new Set<string>();
+  const queuedTitles: string[] = [];
+  let skippedExisting = 0;
+  for (const s of targetSlots) {
+    const existing = await peekSlot(env, s);
+    if (existing) {
+      skippedExisting++;
+      queuedUrls.add(existing.article.canonicalUrl);
+      queuedUrls.add(existing.article.link);
+      queuedTitles.push(existing.article.title);
+      if (existing.article.titleHash) {
+        queuedTitleHashes.add(existing.article.titleHash);
+      }
+    } else {
+      slotsToFill.push(s);
+    }
+  }
+  // Phase 19.8: include all queued entries (kể cả slot ngoài targetSlots —
+  // ngừa case refill cuối ngày kéo lùi vào slot hôm sau).
+  try {
+    const all = await listQueue(env);
+    for (const e of all) {
+      queuedUrls.add(e.payload.article.canonicalUrl);
+      queuedUrls.add(e.payload.article.link);
+      queuedTitles.push(e.payload.article.title);
+      if (e.payload.article.titleHash) {
+        queuedTitleHashes.add(e.payload.article.titleHash);
+      }
+    }
+  } catch (err) {
+    console.warn(
+      `[refill:${runId}] listQueue fail (continuing với target-only dedup): ${(err as Error).message?.slice(0, 200)}`,
+    );
+  }
+
+  if (slotsToFill.length === 0) {
+    console.log(`[refill:${runId}] All ${REFILL_SLOTS} slot đã có queue. No-op.`);
+    return {
+      runId,
+      refilled: 0,
+      skippedExisting,
+      failed: 0,
+      totalSlots: REFILL_SLOTS,
+      reason: "all slots already queued",
+      enqueued,
+    };
+  }
+
+  // Overfetch để dự phòng AI fail (mỗi candidate ~30% rủi ro fail tổng cộng
+  // chuỗi 8 key + OpenRouter; overfetch 2x đủ buffer).
+  const maxCandidates = slotsToFill.length * REFILL_CANDIDATE_OVERFETCH;
+  const pick = await pickCandidates(
+    env,
+    runId,
+    minScoreThreshold,
+    maxCandidates,
+    queuedUrls,
+    queuedTitleHashes,
+    queuedTitles,
+  );
+
+  if (pick.candidates.length === 0) {
+    const reason = pick.totalFetched === 0
+      ? "all RSS sources failed"
+      : pick.freshCount === 0
+        ? "no fresh articles (>48h)"
+        : pick.techCount === 0
+          ? "no tech-relevant articles after filter"
+          : "all candidates đã đăng / poison / dup";
+    console.warn(`[refill:${runId}] No candidate. Reason: ${reason}`);
+    return {
+      runId,
+      refilled: 0,
+      skippedExisting,
+      failed: slotsToFill.length,
+      totalSlots: REFILL_SLOTS,
+      reason,
+      enqueued,
+    };
+  }
+
+  // Diversity re-order trước khi alloc → primaries trải đều category, tránh
+  // toàn bài "ai" khi ai bucket nhiều nhất.
+  const ordered = interleaveByCategory(pick.candidates);
+  const primaries = ordered.slice(0, slotsToFill.length);
+  const fallbackPool = ordered.slice(slotsToFill.length);
+
+  console.log(
+    `[refill:${runId}] Candidates: ${pick.candidates.length} (overfetch ${REFILL_CANDIDATE_OVERFETCH}x), ` +
+      `fill ${slotsToFill.length} slot, primaries=${primaries.length} fallbackPool=${fallbackPool.length} ` +
+      `skipExisting=${skippedExisting}`,
+  );
+
+  type SummarizedSlot = {
+    slot: Date;
+    article: Article;
+    summary: Summary;
+    provider: string;
+  };
+
+  const deadProviders = new Set<string>();
+
+  // Best-effort try summarize 1 article cho 1 slot + ENQUEUE NGAY khi success.
+  // Lý do enqueue inline thay vì batch cuối:
+  //   - Cloudflare `waitUntil` có thể cancel sau ~30s. Nếu enqueue cuối, mọi
+  //     bài đã summarize bị mất. Inline → mỗi bài success persist ngay.
+  //   - Refill kế tiếp (cron backup hoặc /refill manual) skip slot đã có (peekSlot).
+  async function trySummarizeAndEnqueue(
+    article: Article,
+    slot: Date,
+  ): Promise<SummarizedSlot | null> {
+    try {
+      const result = await summarizeArticle(article, env, deadProviders);
+      // Bù og:image nếu RSS không có (post tick KHÔNG re-fetch og để tiết kiệm).
+      if (!article.imageUrl) {
+        try {
+          const og = await extractOgImage(article.link);
+          if (og) article.imageUrl = og;
+        } catch {
+          // og fail không block — Telegram chấp nhận post không có image.
+        }
+      }
+      const payload: QueuePayload = {
+        article: articleToJson(article),
+        summary: result.summary,
+        generatedAt: new Date().toISOString(),
+        scheduledFor: slot.toISOString(),
+        aiProvider: result.provider,
+      };
+      try {
+        await enqueueSlot(env, slot, payload);
+        enqueued.push({
+          slotKey: slotKeyForUTC(slot),
+          title: result.summary.title,
+          provider: result.provider,
+        });
+        console.log(
+          `[refill:${runId}]   ✓ ${slotKeyForUTC(slot)} — "${result.summary.title.slice(0, 60)}" [${result.provider}]`,
+        );
+      } catch (kvErr) {
+        console.error(
+          `[refill:${runId}]   KV enqueue fail at ${slotKeyForUTC(slot)}: ${(kvErr as Error).message?.slice(0, 200)}`,
+        );
+        return null;
+      }
+      return { slot, article, summary: result.summary, provider: result.provider };
+    } catch (err) {
+      console.warn(
+        `[refill:${runId}]   AI fail "${article.title.slice(0, 60)}": ${(err as Error).message?.slice(0, 200)}`,
+      );
+      return null;
+    }
+  }
+
+  // Chunked parallel: chia primaries thành batch ≤ REFILL_PARALLEL_CHUNK.
+  // Mỗi batch chạy Promise.all → đợi xong mới sang batch sau.
+  // Lý do chunk: tránh spike RPM trên 8 Gemini key (15 RPM/key); cũng
+  // không vượt 30s waitUntil của Cloudflare.
+  async function summarizeInChunks(
+    articles: readonly Article[],
+    slots: readonly Date[],
+  ): Promise<(SummarizedSlot | null)[]> {
+    const out: (SummarizedSlot | null)[] = [];
+    for (let i = 0; i < articles.length; i += REFILL_PARALLEL_CHUNK) {
+      const chunk = articles.slice(i, i + REFILL_PARALLEL_CHUNK);
+      const chunkSlots = slots.slice(i, i + REFILL_PARALLEL_CHUNK);
+      const results = await Promise.all(
+        chunk.map((a, j) => trySummarizeAndEnqueue(a, chunkSlots[j])),
+      );
+      out.push(...results);
+    }
+    return out;
+  }
+
+  // Round 1: parallel summarize + enqueue inline tất cả primaries.
+  const round1 = await summarizeInChunks(primaries, slotsToFill);
+  const failedSlotIndices: number[] = [];
+  let round1Ok = 0;
+  for (let i = 0; i < round1.length; i++) {
+    if (round1[i]) round1Ok++;
+    else failedSlotIndices.push(i);
+  }
+  console.log(
+    `[refill:${runId}] Round 1: ${round1Ok}/${primaries.length} OK, ` +
+      `${failedSlotIndices.length} fail. deadProviders=[${[...deadProviders].join(",") || "none"}]`,
+  );
+
+  // Round 2: retry slot fail với fallbackPool (parallel, chunked, inline enqueue).
+  if (failedSlotIndices.length > 0 && fallbackPool.length > 0) {
+    const retryArticles = fallbackPool.slice(0, failedSlotIndices.length);
+    const retrySlots = failedSlotIndices.slice(0, retryArticles.length).map(
+      (idx) => slotsToFill[idx],
+    );
+    const round2 = await summarizeInChunks(retryArticles, retrySlots);
+    const recovered = round2.filter((r) => r).length;
+    console.log(`[refill:${runId}] Round 2: ${recovered}/${round2.length} recovered`);
+  }
+
+  const failed = slotsToFill.length - enqueued.length;
+  console.log(
+    `[refill:${runId}] Done. enqueued=${enqueued.length}/${slotsToFill.length} ` +
+      `skippedExisting=${skippedExisting} failed=${failed}`,
+  );
+  return {
+    runId,
+    refilled: enqueued.length,
+    skippedExisting,
+    failed,
+    totalSlots: REFILL_SLOTS,
+    enqueued,
+  };
+}
+
+/**
+ * Phase 19.8: post 1 bài cho slot hiện tại từ queue đã refill.
+ *
+ * Flow:
+ *   1. dequeueSlot(currentSlot) → nếu có payload → post lên Telegram + KV book-keeping.
+ *   2. Nếu queue empty → fallback `runBot` (realtime AI) làm safety net.
+ *
+ * Race protection: trước khi gửi Telegram, re-check `isPosted(article.link)`
+ * để chống dup nếu 2 isolate dequeue cùng slot (KV không atomic).
+ */
+async function runQueuePost(env: Env, slotDate: Date): Promise<RunResult> {
+  const runId = shortRunId();
+  const slotKey = slotKeyForUTC(slotDate);
+  console.log(`[qpost:${runId}] Post tick for ${slotKey}`);
+
+  const payload = await dequeueSlot(env, slotDate);
+  if (!payload) {
+    console.warn(
+      `[qpost:${runId}] Queue empty for ${slotKey}. Fallback realtime AI.`,
+    );
+    const result = await runBot(env);
+    return {
+      ...result,
+      reason: result.reason
+        ? `queue empty → fallback: ${result.reason}`
+        : `queue empty → fallback realtime`,
+    };
+  }
+
+  const article = articleFromJson(payload.article);
+  const summary = payload.summary;
+  const tag = `[qpost:${runId}]`;
+
+  if (await isPosted(env, article.link)) {
+    console.warn(
+      `${tag} Race: bài "${article.title.slice(0, 60)}" đã được post bởi run khác. Fallback realtime.`,
+    );
+    const result = await runBot(env);
+    return {
+      ...result,
+      reason: result.reason
+        ? `queue race → fallback: ${result.reason}`
+        : `queue race → fallback realtime`,
+    };
+  }
+
+  try {
+    await reservePost(env, article.link, summary.title);
+  } catch (err) {
+    console.error(
+      `${tag} Reserve fail: ${(err as Error).message?.slice(0, 200)}. Fallback realtime.`,
+    );
+    const result = await runBot(env);
+    return {
+      ...result,
+      reason: `reserve fail → fallback: ${result.reason ?? "unknown"}`,
+    };
+  }
+
+  try {
+    console.log(
+      `${tag} Posting "${summary.title}" [${article.sourceCategory}, ` +
+        `score=${article.score ?? 0}, provider=${payload.aiProvider}, ` +
+        `aged=${Math.round((Date.now() - new Date(payload.generatedAt).getTime()) / 60000)}min]`,
+    );
+    await postArticle(article, summary, env);
+    const dayKey = todayKeyUTC();
+    const lastPostedPayload = {
+      title: summary.title,
+      source: article.source,
+      link: article.link,
+      category: article.sourceCategory,
+      score: article.score ?? 0,
+      postedAt: new Date().toISOString(),
+      provider: payload.aiProvider,
+    };
+    const kvWrites = await runKvOps([
+      { name: "clearFailCount", op: () => clearFailCount(env, article.link) },
+      { name: "markTitlePosted", op: () => markTitlePosted(env, article.title) },
+      { name: "pushRecentTitle", op: () => pushRecentTitle(env, article.title) },
+      {
+        name: "incrementCategoryUsage",
+        op: () => incrementCategoryUsage(env, article.sourceCategory, dayKey),
+      },
+      { name: "setLastPosted", op: () => setLastPosted(env, lastPostedPayload) },
+      {
+        name: "pushScoreHistory",
+        op: () => pushScoreHistory(env, article.score ?? Number.NaN),
+      },
+    ]);
+    const sum = summarizeKvResults(kvWrites);
+    if (sum.failCount > 0) {
+      console.error(`${tag} ⚠️ KV book-keeping ${sum.statusLine}: ${sum.failDetail}`);
+    }
+    console.log(
+      `${tag} ✅ Posted from queue. kvWrites=${sum.okCount}/${kvWrites.length}`,
+    );
+    return {
+      runId,
+      posted: true,
+      attempted: 1,
+      postedTitle: summary.title,
+      postedSource: article.source,
+      postedLink: article.link,
+      reason: `from queue (slot=${slotKey}, provider=${payload.aiProvider})`,
+      kvWrites,
+    };
+  } catch (err) {
+    const msg = (err as Error).message?.slice(0, 200);
+    console.error(`${tag} Telegram fail: ${msg}. Rollback reserve.`);
+    try {
+      await unreservePost(env, article.link);
+    } catch (e) {
+      console.error(
+        `${tag} ⚠️ CRITICAL: unreserve fail. "${article.title}" mark-posted nhưng CHƯA gửi. ` +
+          `Cần xóa thủ công posted:* trong KV. Err: ${(e as Error).message?.slice(0, 200)}`,
+      );
+    }
+    // Telegram fail tại post path → KHÔNG re-fetch RSS, chấp nhận miss slot.
+    // Refill kế tiếp sẽ fill slot này lại; manual /run có thể bù.
+    return {
+      runId,
+      posted: false,
+      attempted: 1,
+      postedTitle: summary.title,
+      postedSource: article.source,
+      postedLink: article.link,
+      reason: `queue post Telegram fail: ${msg}`,
+    };
+  }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Auth helpers
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -838,19 +1328,37 @@ export default {
     ctx: ExecutionContext,
   ): Promise<void> {
     const startedAt = new Date().toISOString();
-    // Phase 17: log cron meta (cron expression + scheduled time) để admin
-    // distinguish "cron không fire" vs "cron fire nhưng pipeline fail".
+    const scheduledTime = new Date(controller.scheduledTime);
     console.log(
       `[bot] Cron triggered at ${startedAt} (UTC). cronExpr=${controller.cron} ` +
-        `scheduledTime=${new Date(controller.scheduledTime).toISOString()}`,
+        `scheduledTime=${scheduledTime.toISOString()}`,
     );
+
+    // Phase 19.8: route theo cron expression.
+    //   - REFILL_CRON_EXPRS (06:30/35/40 UTC) → tóm tắt sẵn 18 bài cho ngày tới.
+    //   - Default ("0 0-17 * * *") → post 1 bài từ queue (slot = giờ tròn hiện tại).
+    if (REFILL_CRON_EXPRS.has(controller.cron)) {
+      ctx.waitUntil(
+        runQueueRefill(env)
+          .then((r) => {
+            console.log(
+              `[refill:${r.runId}] Cron refill done. refilled=${r.refilled}/${r.totalSlots} ` +
+                `skippedExisting=${r.skippedExisting} failed=${r.failed}` +
+                (r.reason ? ` reason="${r.reason}"` : ""),
+            );
+          })
+          .catch((err) => console.error("[bot] FATAL (refill cron):", err)),
+      );
+      return;
+    }
+
+    // Post cron: align về giờ tròn của scheduledTime để tra slot key.
+    const slotDate = currentHourSlot(scheduledTime);
     ctx.waitUntil(
-      runBot(env)
+      runQueuePost(env, slotDate)
         .then((result) => {
-          // Echo final decision lên log để cron-only run cũng có summary 1 dòng
-          // (trước đây chỉ /run mới thấy RunResult).
           console.log(
-            `[bot:${result.runId}] Cron run finished. posted=${result.posted} ` +
+            `[bot:${result.runId}] Post cron done. posted=${result.posted} ` +
               `attempted=${result.attempted}` +
               (result.postedTitle ? ` title="${result.postedTitle.slice(0, 80)}"` : "") +
               (result.reason ? ` reason="${result.reason.slice(0, 200)}"` : "") +
@@ -859,10 +1367,7 @@ export default {
                 : ""),
           );
         })
-        .catch((err) => {
-          // runBot không nên throw, nhưng phòng lỗi lập trình.
-          console.error("[bot] FATAL (cron):", err);
-        }),
+        .catch((err) => console.error("[bot] FATAL (post cron):", err)),
     );
   },
 
@@ -1178,13 +1683,118 @@ export default {
       );
     }
 
+    // ───── /queue: list pending queue (Phase 19.8) ─────
+    if (url.pathname === "/queue") {
+      if (!isAuthorized(req, env)) {
+        return new Response("Unauthorized\n", { status: 401 });
+      }
+      const entries = await listQueue(env);
+      const body = {
+        total: entries.length,
+        slots: entries.map((e) => ({
+          slot: e.slot,
+          scheduledFor: e.payload.scheduledFor,
+          title: e.payload.summary.title,
+          source: e.payload.article.source,
+          category: e.payload.article.sourceCategory,
+          provider: e.payload.aiProvider,
+          generatedAt: e.payload.generatedAt,
+          ageMin: Math.round(
+            (Date.now() - new Date(e.payload.generatedAt).getTime()) / 60000,
+          ),
+        })),
+        checkedAt: new Date().toISOString(),
+      };
+      return new Response(JSON.stringify(body, null, 2), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    // ───── /clear_queue: xoá toàn bộ queue (Phase 19.8, Bearer, admin only) ─────
+    if (url.pathname === "/clear_queue") {
+      if (req.method !== "POST") {
+        return new Response("Method Not Allowed. Use POST.\n", {
+          status: 405,
+          headers: { Allow: "POST" },
+        });
+      }
+      if (!isAuthorized(req, env)) {
+        return new Response("Unauthorized\n", { status: 401 });
+      }
+      try {
+        const all = await listQueue(env);
+        for (const e of all) {
+          await env.POSTED_KV.delete(e.slot);
+        }
+        return new Response(
+          JSON.stringify({ cleared: all.length, at: new Date().toISOString() }, null, 2),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      } catch (err) {
+        return new Response(
+          JSON.stringify({ error: (err as Error).message }, null, 2),
+          { status: 500, headers: { "Content-Type": "application/json" } },
+        );
+      }
+    }
+
+    // ───── /refill: manual queue refill (Phase 19.8, Bearer) ─────
+    if (url.pathname === "/refill") {
+      if (req.method !== "POST") {
+        return new Response("Method Not Allowed. Use POST.\n", {
+          status: 405,
+          headers: { Allow: "POST" },
+        });
+      }
+      if (!isAuthorized(req, env)) {
+        return new Response("Unauthorized\n", { status: 401 });
+      }
+      // Debug mode: ?sync=1 → await refill và trả JSON kết quả (để debug).
+      // Lưu ý: Cloudflare worker request cũng có giới hạn 30s, nên chỉ dùng
+      // khi cần inspect chi tiết.
+      if (url.searchParams.get("sync") === "1") {
+        try {
+          const r = await runQueueRefill(env);
+          return new Response(JSON.stringify(r, null, 2), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        } catch (err) {
+          return new Response(
+            JSON.stringify(
+              { error: (err as Error).message, stack: (err as Error).stack?.slice(0, 500) },
+              null,
+              2,
+            ),
+            { status: 500, headers: { "Content-Type": "application/json" } },
+          );
+        }
+      }
+      ctx.waitUntil(
+        runQueueRefill(env)
+          .then((r) =>
+            console.log(
+              `[refill:${r.runId}] Manual refill done. refilled=${r.refilled}/${r.totalSlots}`,
+            ),
+          )
+          .catch((err) => console.error("[bot] FATAL (manual refill):", err)),
+      );
+      return new Response(
+        "Queue refill triggered manually (async). Check `/queue` after ~1-2 min.\n",
+        { status: 202 },
+      );
+    }
+
     return new Response(
       "Tech Buzz Daily bot worker.\n" +
         "Endpoints (Bearer = cần Authorization: Bearer <RUN_TRIGGER_TOKEN>):\n" +
         "  GET  /health                  — ping\n" +
-        "  POST /run (Bearer)            — trigger ngay (async)\n" +
+        "  POST /run (Bearer)            — trigger post realtime ngay (async, fallback path)\n" +
         "  POST /run?dry=1 (Bearer)      — dry-run, trả về candidate sẽ chọn (KHÔNG post)\n" +
         "  POST /force_fetch (Bearer)    — alias của /run\n" +
+        "  POST /refill (Bearer)         — Phase 19.8: tóm tắt sẵn 18 bài cho 18 slot kế tiếp (async)\n" +
+        "  GET  /queue     (Bearer)      — Phase 19.8: list slot đã queue (slot, title, provider, age)\n" +
         "  GET  /sources   (Bearer)      — source health report\n" +
         "  GET  /stats     (Bearer)      — bucket usage hôm nay + threshold động (Task 7) + recent titles\n" +
         "  GET  /last      (Bearer)      — snapshot bài đăng gần nhất\n" +

@@ -1677,3 +1677,270 @@ test("wasAdminAlertSent / markAdminAlertSent: flag flow + TTL + day-isolation", 
   assert.equal(await getSkippedSlotCount(kv, "2026-04-29"), 0,
     "set flag KHÔNG được vô tình tăng counter");
 });
+
+// ────────────────────────────────────────────────────────────────────────────
+// Phase 19.8: queue module (slot key, enqueue/dequeue, slot enumeration)
+// ────────────────────────────────────────────────────────────────────────────
+
+import {
+  slotKeyForUTC,
+  currentHourSlot,
+  nextHourSlot,
+  isPostHourUTC,
+  enumerateNextPostSlots,
+  articleToJson,
+  articleFromJson,
+  enqueueSlot,
+  peekSlot,
+  dequeueSlot,
+  clearSlot,
+  listQueue,
+  type QueueEnv,
+  type QueuePayload,
+} from "../src/queue.ts";
+
+function makeFakeKvForQueue() {
+  const store = new Map<string, { value: string; ttl?: number }>();
+  const kv = {
+    get: async (k: string) => store.get(k)?.value ?? null,
+    put: async (k: string, v: string, opts?: { expirationTtl?: number }) => {
+      store.set(k, { value: v, ttl: opts?.expirationTtl });
+    },
+    delete: async (k: string) => {
+      store.delete(k);
+    },
+    list: async (opts?: { prefix?: string }) => {
+      const prefix = opts?.prefix ?? "";
+      const keys = [...store.keys()]
+        .filter((k) => k.startsWith(prefix))
+        .map((name) => ({ name }));
+      return { keys, list_complete: true, cursor: "" };
+    },
+  } as unknown as KVNamespace;
+  return { store, env: { POSTED_KV: kv } as QueueEnv };
+}
+
+const fakeArticle = {
+  title: "Sample tech post",
+  link: "https://example.com/a",
+  canonicalUrl: "https://example.com/a",
+  pubDate: new Date("2026-04-30T05:00:00.000Z"),
+  source: "Example",
+  sourceCategory: "ai" as const,
+  sourcePriority: "p1" as const,
+  contentSnippet: "snippet here",
+  imageUrl: "https://example.com/img.jpg",
+  score: 220,
+  titleHash: "deadbeef",
+};
+
+const fakeSummary = {
+  title: "VN title here",
+  body: "body line 1\nbody line 2",
+  hashtag: "#AI",
+};
+
+test("slotKeyForUTC: format đúng `queue:YYYY-MM-DDTHH` với pad-zero", () => {
+  assert.equal(
+    slotKeyForUTC(new Date("2026-04-30T07:00:00.000Z")),
+    "queue:2026-04-30T07",
+  );
+  assert.equal(
+    slotKeyForUTC(new Date("2026-12-01T00:30:45.000Z")),
+    "queue:2026-12-01T00",
+  );
+  assert.equal(
+    slotKeyForUTC(new Date("2026-01-09T17:59:59.999Z")),
+    "queue:2026-01-09T17",
+  );
+});
+
+test("currentHourSlot: align về :00 cùng giờ UTC", () => {
+  const out = currentHourSlot(new Date("2026-04-30T14:37:22.123Z"));
+  assert.equal(out.toISOString(), "2026-04-30T14:00:00.000Z");
+});
+
+test("nextHourSlot: tăng 1 giờ + align :00 (kể cả khi minute=0)", () => {
+  assert.equal(
+    nextHourSlot(new Date("2026-04-30T14:00:00.000Z")).toISOString(),
+    "2026-04-30T15:00:00.000Z",
+  );
+  assert.equal(
+    nextHourSlot(new Date("2026-04-30T14:37:22.123Z")).toISOString(),
+    "2026-04-30T15:00:00.000Z",
+  );
+  // Wrap qua ngày
+  assert.equal(
+    nextHourSlot(new Date("2026-04-30T23:30:00.000Z")).toISOString(),
+    "2026-05-01T00:00:00.000Z",
+  );
+});
+
+test("isPostHourUTC: chỉ 0..17 là post hour (Phase 19.6 cron)", () => {
+  for (let h = 0; h <= 17; h++) assert.equal(isPostHourUTC(h), true, `${h} phải là post hour`);
+  for (let h = 18; h <= 23; h++) assert.equal(isPostHourUTC(h), false, `${h} KHÔNG phải post hour`);
+});
+
+test("enumerateNextPostSlots: refill từ 06:30 UTC → 18 slot trải 2 ngày", () => {
+  const slots = enumerateNextPostSlots(new Date("2026-04-30T06:30:00.000Z"), 18);
+  assert.equal(slots.length, 18);
+  // Slot đầu = 07:00 UTC cùng ngày
+  assert.equal(slots[0].toISOString(), "2026-04-30T07:00:00.000Z");
+  // Slot thứ 11 (idx 10) = 17:00 UTC cùng ngày (last today)
+  assert.equal(slots[10].toISOString(), "2026-04-30T17:00:00.000Z");
+  // Slot 12 (idx 11) phải SKIP qua đêm về 00:00 UTC ngày mai
+  assert.equal(slots[11].toISOString(), "2026-05-01T00:00:00.000Z");
+  // Slot cuối = 06:00 UTC ngày mai
+  assert.equal(slots[17].toISOString(), "2026-05-01T06:00:00.000Z");
+  // Tất cả slot phải là post hour
+  for (const s of slots) {
+    assert.equal(isPostHourUTC(s.getUTCHours()), true);
+  }
+});
+
+test("enumerateNextPostSlots: từ 17:30 UTC → slot đầu phải skip 18-23 → 00:00 ngày mai", () => {
+  const slots = enumerateNextPostSlots(new Date("2026-04-30T17:30:00.000Z"), 3);
+  assert.equal(slots[0].toISOString(), "2026-05-01T00:00:00.000Z");
+  assert.equal(slots[1].toISOString(), "2026-05-01T01:00:00.000Z");
+  assert.equal(slots[2].toISOString(), "2026-05-01T02:00:00.000Z");
+});
+
+test("articleToJson + articleFromJson: round-trip bảo toàn data, Date↔ISO", () => {
+  const j = articleToJson(fakeArticle);
+  assert.equal(typeof j.pubDate, "string");
+  assert.equal(j.pubDate, "2026-04-30T05:00:00.000Z");
+  const back = articleFromJson(j);
+  assert.equal(back.title, fakeArticle.title);
+  assert.equal(back.link, fakeArticle.link);
+  assert.equal(back.canonicalUrl, fakeArticle.canonicalUrl);
+  assert.equal(back.pubDate.toISOString(), fakeArticle.pubDate.toISOString());
+  assert.equal(back.source, fakeArticle.source);
+  assert.equal(back.sourceCategory, fakeArticle.sourceCategory);
+  assert.equal(back.sourcePriority, fakeArticle.sourcePriority);
+  assert.equal(back.contentSnippet, fakeArticle.contentSnippet);
+  assert.equal(back.imageUrl, fakeArticle.imageUrl);
+  assert.equal(back.score, fakeArticle.score);
+  assert.equal(back.titleHash, fakeArticle.titleHash);
+});
+
+test("articleToJson: imageUrl undefined giữ nguyên undefined (không leak rác)", () => {
+  const j = articleToJson({ ...fakeArticle, imageUrl: undefined });
+  assert.equal(j.imageUrl, undefined);
+  const back = articleFromJson(j);
+  assert.equal(back.imageUrl, undefined);
+});
+
+test("enqueueSlot + peekSlot + dequeueSlot: happy path round-trip", async () => {
+  const { store, env } = makeFakeKvForQueue();
+  const slot = new Date("2026-04-30T08:00:00.000Z");
+  const payload: QueuePayload = {
+    article: articleToJson(fakeArticle),
+    summary: fakeSummary,
+    generatedAt: "2026-04-30T06:30:01.000Z",
+    scheduledFor: slot.toISOString(),
+    aiProvider: "gemini-2.5-k0",
+  };
+
+  await enqueueSlot(env, slot, payload);
+
+  // TTL phải set ~36h
+  const entry = store.get("queue:2026-04-30T08");
+  assert.ok(entry, "key phải tồn tại");
+  assert.ok(
+    entry!.ttl && entry!.ttl >= 24 * 3600 && entry!.ttl <= 48 * 3600,
+    `TTL phải [24h, 48h], thực tế = ${entry!.ttl}`,
+  );
+
+  // peek không xóa
+  const peeked = await peekSlot(env, slot);
+  assert.deepEqual(peeked, payload);
+  assert.ok(store.has("queue:2026-04-30T08"), "peek không được xóa");
+
+  // dequeue trả payload + xóa
+  const got = await dequeueSlot(env, slot);
+  assert.deepEqual(got, payload);
+  assert.equal(store.has("queue:2026-04-30T08"), false, "dequeue phải xóa key");
+
+  // dequeue lần 2 → null
+  assert.equal(await dequeueSlot(env, slot), null);
+});
+
+test("dequeueSlot: corrupted JSON → return null + xóa key (clean rác)", async () => {
+  const { store, env } = makeFakeKvForQueue();
+  store.set("queue:2026-04-30T09", { value: "not valid json {{{" });
+  const slot = new Date("2026-04-30T09:00:00.000Z");
+  const got = await dequeueSlot(env, slot);
+  assert.equal(got, null);
+  assert.equal(store.has("queue:2026-04-30T09"), false, "key corrupted phải bị xóa");
+});
+
+test("peekSlot: corrupted JSON → null nhưng KHÔNG xóa (caller dequeue mới xóa)", async () => {
+  const { store, env } = makeFakeKvForQueue();
+  store.set("queue:2026-04-30T09", { value: "{bad}" });
+  const slot = new Date("2026-04-30T09:00:00.000Z");
+  assert.equal(await peekSlot(env, slot), null);
+  assert.equal(store.has("queue:2026-04-30T09"), true, "peek không được xóa rác");
+});
+
+test("clearSlot: xóa slot bất kể có hay không", async () => {
+  const { store, env } = makeFakeKvForQueue();
+  const slot = new Date("2026-04-30T10:00:00.000Z");
+  await enqueueSlot(env, slot, {
+    article: articleToJson(fakeArticle),
+    summary: fakeSummary,
+    generatedAt: new Date().toISOString(),
+    scheduledFor: slot.toISOString(),
+    aiProvider: "test",
+  });
+  assert.ok(store.has("queue:2026-04-30T10"));
+  await clearSlot(env, slot);
+  assert.equal(store.has("queue:2026-04-30T10"), false);
+  // Idempotent: clear lại không throw
+  await clearSlot(env, slot);
+});
+
+test("listQueue: trả entry sort theo slot key tăng dần, skip corrupted", async () => {
+  const { store, env } = makeFakeKvForQueue();
+  const mkPayload = (h: number): QueuePayload => ({
+    article: articleToJson(fakeArticle),
+    summary: { ...fakeSummary, title: `t${h}` },
+    generatedAt: new Date().toISOString(),
+    scheduledFor: `2026-04-30T${String(h).padStart(2, "0")}:00:00.000Z`,
+    aiProvider: "p",
+  });
+  await enqueueSlot(env, new Date("2026-04-30T15:00:00Z"), mkPayload(15));
+  await enqueueSlot(env, new Date("2026-04-30T07:00:00Z"), mkPayload(7));
+  await enqueueSlot(env, new Date("2026-04-30T10:00:00Z"), mkPayload(10));
+  // Inject 1 entry corrupted
+  store.set("queue:2026-04-30T11", { value: "{bad}" });
+  // Inject 1 entry không phải prefix queue: → list không được trả
+  store.set("posted:abc123", { value: "1" });
+
+  const entries = await listQueue(env);
+  assert.equal(entries.length, 3, "corrupted skip + non-queue: prefix không match");
+  assert.deepEqual(
+    entries.map((e) => e.slot),
+    ["queue:2026-04-30T07", "queue:2026-04-30T10", "queue:2026-04-30T15"],
+    "phải sort tăng dần theo slot key",
+  );
+  assert.equal(entries[0].payload.summary.title, "t7");
+});
+
+test("enqueueSlot: re-enqueue cùng slot → ghi đè (idempotent refill rerun)", async () => {
+  const { store, env } = makeFakeKvForQueue();
+  const slot = new Date("2026-04-30T12:00:00.000Z");
+  const p1: QueuePayload = {
+    article: articleToJson(fakeArticle),
+    summary: { ...fakeSummary, title: "old" },
+    generatedAt: "2026-04-30T06:00:00.000Z",
+    scheduledFor: slot.toISOString(),
+    aiProvider: "v1",
+  };
+  const p2: QueuePayload = { ...p1, summary: { ...fakeSummary, title: "new" }, aiProvider: "v2" };
+  await enqueueSlot(env, slot, p1);
+  await enqueueSlot(env, slot, p2);
+  assert.equal(store.size, 1, "không tạo key thứ 2");
+  const got = await peekSlot(env, slot);
+  assert.equal(got!.summary.title, "new");
+  assert.equal(got!.aiProvider, "v2");
+});
